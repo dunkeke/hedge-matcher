@@ -24,61 +24,37 @@ def standardize_month_vectorized(series):
     dates = pd.to_datetime(s, errors='coerce')
     return dates.dt.strftime('%b %y').str.upper().fillna(s)
 
-def read_file_fast(file_input):
+def read_file_fast(file_path):
     """
-    通用读取函数：
-    - 支持本地文件路径 (str) -> 用于本地调试/Deepnote
-    - 支持文件对象 (UploadedFile/BytesIO) -> 用于 Streamlit
+    读取文件，支持 csv 和 Excel 格式，自动尝试不同编码。
     """
-    # --- 情况 A: 输入是 Streamlit 的文件对象 (不是字符串) ---
-    if not isinstance(file_input, str):
-        # 1. 尝试作为 Excel 读取
-        try:
-            if hasattr(file_input, 'seek'): file_input.seek(0) # 重置指针
-            return pd.read_excel(file_input)
-        except:
-            pass
-        
-        # 2. 尝试作为 CSV 读取 (轮询编码)
-        encodings = ['utf-8', 'utf-8-sig', 'gbk', 'gb18030', 'latin1']
-        for enc in encodings:
-            try:
-                if hasattr(file_input, 'seek'): file_input.seek(0)
-                return pd.read_csv(file_input, encoding=enc)
-            except:
-                continue
-        raise ValueError("无法识别上传文件的格式或编码 (请确保是有效的 Excel 或 CSV)")
-
-    # --- 情况 B: 输入是本地文件路径 (字符串) ---
-    # 只有当它是字符串时，才调用 os.path.exists
-    if not os.path.exists(file_input):
-        # 容错：尝试找同名不同后缀的文件
-        base, ext = os.path.splitext(file_input)
+    if not os.path.exists(file_path):
+        base, ext = os.path.splitext(file_path)
         alt_ext = '.csv' if ext in ['.xlsx', '.xls'] else '.xlsx'
         alt_path = base + alt_ext
         if os.path.exists(alt_path):
-            file_input = alt_path
+            file_path = alt_path
         else:
-            raise FileNotFoundError(f"未找到文件: {file_input}")
+            raise FileNotFoundError(f"未找到文件: {file_path}")
 
-    print(f"正在读取本地文件: {os.path.basename(file_input)}...")
+    print(f"正在读取文件: {os.path.basename(file_path)}...")
     
-    # 尝试 Excel
-    if file_input.lower().endswith(('.xlsx', '.xls')):
+    # 先尝试读取 Excel
+    if file_path.lower().endswith(('.xlsx', '.xls')):
         try:
-            return pd.read_excel(file_input)
-        except:
+            return pd.read_excel(file_path)
+        except Exception:
             pass
             
-    # 尝试 CSV
+    # 尝试不同编码读取 CSV
     encodings = ['utf-8', 'utf-8-sig', 'gbk', 'gb18030', 'latin1']
     for enc in encodings:
         try:
-            return pd.read_csv(file_input, encoding=enc)
-        except:
+            return pd.read_csv(file_path, encoding=enc)
+        except Exception:
             continue
             
-    raise ValueError(f"无法识别文件编码: {file_input}")
+    raise ValueError(f"无法识别文件编码: {file_path}")
 
 # ==============================================================================
 # 2. 数据加载与清洗 (Data Loading)
@@ -323,3 +299,7 @@ def auto_match_hedges(physical_df, paper_df):
         paper_df['Allocated_To_Phy'] = 0.0
         
     return pd.DataFrame(hedge_relations), physical_df_sorted, paper_df
+
+if __name__ == "__main__":
+    # 本地测试接口
+    print("Hedge Engine Loaded. Please use via Streamlit App.")
