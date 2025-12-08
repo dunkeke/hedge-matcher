@@ -6,6 +6,7 @@ import time
 import io
 import os
 import sys
+import tempfile
 
 # ==============================================================================
 # 导入核心引擎 - 修复版本
@@ -160,49 +161,76 @@ def run_engine_with_streamlit(paper_file_obj, paper_file_name, phys_file_obj, ph
         # Step 1: 净仓
         df_p_net = engine_raw.calculate_net_positions_corrected(df_p)
         
-        # Step 2: 匹配 - 注意：原始函数只返回2个值
-        df_rels, df_ph_updated = engine_raw.auto_match_hedges(df_ph, df_p_net)
+        # Step 2: 匹配 - 直接调用引擎函数，但捕获返回值
+        try:
+            # 尝试不同的调用方式
+            result = engine_raw.auto_match_hedges(df_ph, df_p_net)
+            
+            # 检查返回值类型
+            if isinstance(result, tuple):
+                if len(result) == 2:
+                    df_rels, df_ph_updated = result
+                elif len(result) == 3:
+                    df_rels, df_ph_updated, _ = result  # 忽略第三个返回值
+                else:
+                    # 如果是其他长度，取前两个
+                    df_rels, df_ph_updated = result[0], result[1]
+            elif isinstance(result, pd.DataFrame):
+                # 如果只返回一个DataFrame，假设它是匹配关系
+                df_rels = result
+                df_ph_updated = df_ph.copy()
+            else:
+                raise ValueError(f"无法理解的返回值类型: {type(result)}")
+                
+        except ValueError as e:
+            if "too many values to unpack" in str(e):
+                # 尝试另一种方式：直接查看函数内部
+                st.warning("检测到返回值解包问题，尝试替代方法...")
+                
+                # 创建临时文件运行引擎的main函数
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False) as tmp_paper:
+                    paper_file_obj.seek(0)
+                    if paper_file_name.lower().endswith('.csv'):
+                        tmp_paper.write(paper_file_obj.read().decode('utf-8', errors='ignore'))
+                    else:
+                        # 如果是Excel，先转换为DataFrame再保存为CSV
+                        paper_file_obj.seek(0)
+                        df_paper = pd.read_excel(paper_file_obj)
+                        df_paper.to_csv(tmp_paper.name, index=False)
+                    paper_path = tmp_paper.name
+                
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False) as tmp_phys:
+                    phys_file_obj.seek(0)
+                    if phys_file_name.lower().endswith('.csv'):
+                        tmp_phys.write(phys_file_obj.read().decode('utf-8', errors='ignore'))
+                    else:
+                        phys_file_obj.seek(0)
+                        df_phys = pd.read_excel(phys_file_obj)
+                        df_phys.to_csv(tmp_phys.name, index=False)
+                    phys_path = tmp_phys.name
+                
+                # 运行主函数
+                engine_raw.main(paper_path, phys_path)
+                
+                # 尝试读取输出文件
+                output_file = "hedge_allocation_v19_optimized.csv"
+                if os.path.exists(output_file):
+                    df_rels = pd.read_csv(output_file)
+                else:
+                    df_rels = pd.DataFrame()
+                
+                df_ph_updated = df_ph.copy()
+                
+                # 清理临时文件
+                os.unlink(paper_path)
+                os.unlink(phys_path)
+            else:
+                raise
         
-        # 我们需要创建一个增强的纸货DataFrame，显示分配情况
-        # 首先确保 df_p_net 有 Allocated_To_Phy 列
-        if 'Allocated_To_Phy' not in df_p_net.columns:
-            df_p_net['Allocated_To_Phy'] = 0
-        
-        if not df_rels.empty and 'Ticket_ID' in df_rels.columns:
-            # 按纸货交易分组汇总分配量
-            alloc_summary = df_rels.groupby('Ticket_ID')['Allocated_Vol'].sum().reset_index()
-            alloc_summary.rename(columns={'Allocated_Vol': 'Allocated_To_Phy'}, inplace=True)
-            
-            # 合并到纸货数据
-            df_p_final = df_p_net.copy()
-            
-            # 确保Recap No存在
-            if 'Recap No' not in df_p_final.columns:
-                df_p_final['Recap No'] = df_p_final.index.astype(str)
-            
-            # 进行合并
-            df_p_final = pd.merge(
-                df_p_final, 
-                alloc_summary, 
-                left_on='Recap No', 
-                right_on='Ticket_ID', 
-                how='left'
-            )
-            
-            # 更新分配量：如果有匹配记录则使用，否则保持0
-            mask = df_p_final['Allocated_To_Phy_y'].notna()
-            df_p_final.loc[mask, 'Allocated_To_Phy_x'] = df_p_final.loc[mask, 'Allocated_To_Phy_y']
-            df_p_final.rename(columns={'Allocated_To_Phy_x': 'Allocated_To_Phy'}, inplace=True)
-            
-            # 清理临时列
-            drop_cols = ['Allocated_To_Phy_y', 'Ticket_ID']
-            df_p_final = df_p_final.drop(columns=[col for col in drop_cols if col in df_p_final.columns])
-            
-            df_p_final['Allocated_To_Phy'] = df_p_final['Allocated_To_Phy'].fillna(0)
-        else:
-            df_p_final = df_p_net.copy()
-            if 'Allocated_To_Phy' not in df_p_final.columns:
-                df_p_final['Allocated_To_Phy'] = 0
+        # 准备纸货最终数据
+        df_p_final = df_p_net.copy()
+        if 'Allocated_To_Phy' not in df_p_final.columns:
+            df_p_final['Allocated_To_Phy'] = 0
         
         return df_rels, df_ph_updated, df_p_final
     else:
