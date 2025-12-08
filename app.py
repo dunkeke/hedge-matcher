@@ -13,7 +13,7 @@ import warnings
 warnings.filterwarnings("ignore")
 
 # ==============================================================================
-# 1. 核心计算引擎 (v20 Core Engine) - 直接集成，无需额外文件
+# 1. 核心计算引擎 (v20 Core Engine)
 # ==============================================================================
 
 def clean_str(series):
@@ -369,7 +369,8 @@ if run_btn:
 
                 # --- 详细数据 Tab 页 ---
                 st.subheader("📋 详细数据账本")
-                tab1, tab2, tab3 = st.tabs(["✅ 匹配明细账本 (Allocation)", ⚠️ 实货剩余敞口 (Unhedged Cargo)", "📦 纸货剩余头寸 (Unmatched Paper)"])
+                # 修复引号问题：
+                tab1, tab2, tab3 = st.tabs(["✅ 匹配明细账本 (Allocation)", "⚠️ 实货剩余敞口 (Unhedged Cargo)", "📦 纸货剩余头寸 (Unmatched Paper)"])
                 
                 with tab1:
                     if not df_rels.empty:
@@ -388,9 +389,6 @@ if run_btn:
                     
                 with tab3:
                     # 计算剩余纸货
-                    # df_p_final 中有 Allocated_To_Phy，但没有 Net_Open_Vol (因为在step1是在list里算的)
-                    # 我们需要重新 merge 或者简单计算
-                    # 这里为了展示，我们展示 原始量 - 分配量
                     df_p_final['Implied_Remaining'] = df_p_final['Volume'] - df_p_final['Allocated_To_Phy']
                     unused_paper = df_p_final[abs(df_p_final['Implied_Remaining']) > 1]
                     st.dataframe(unused_paper[['Recap No', 'Std_Commodity', 'Month', 'Volume', 'Allocated_To_Phy', 'Implied_Remaining', 'Price']], use_container_width=True)
