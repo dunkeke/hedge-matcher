@@ -2,9 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
-import plotly.graph_objects as go
 import time
-import io
 from datetime import datetime
 from collections import deque
 import warnings
@@ -13,7 +11,7 @@ import warnings
 warnings.filterwarnings("ignore")
 
 # ==============================================================================
-# 1. 核心计算引擎 (v20 Core Engine)
+# 1. 核心计算引擎 (基于 v19 逻辑 + v20 报表)
 # ==============================================================================
 
 def clean_str(series):
@@ -22,6 +20,8 @@ def clean_str(series):
 def standardize_month_vectorized(series):
     """批量标准化月份格式"""
     s = series.astype(str).str.strip().str.upper()
+    # 处理可能的 float 类型 (如 Excel 里的 2025)
+    s = s.replace('NAN', '')
     s = s.str.replace('-', ' ', regex=False).str.replace('/', ' ', regex=False)
     dates = pd.to_datetime(s, errors='coerce')
     # 格式化为 MMM YY (例如 DEC 25)
@@ -51,7 +51,7 @@ def load_data_engine(paper_file, phys_file):
         st.error(f"文件读取失败: {e}")
         return pd.DataFrame(), pd.DataFrame()
 
-    # --- 清除列名空格 (关键修复) ---
+    # --- 清除列名空格 ---
     df_p.columns = df_p.columns.str.strip()
     df_ph.columns = df_ph.columns.str.strip()
 
@@ -73,7 +73,6 @@ def load_data_engine(paper_file, phys_file):
         if col not in df_p.columns: df_p[col] = 0
 
     # --- 实货清洗 ---
-    # 兼容多种列名
     col_map = {
         'Target_Pricing_Month': 'Target_Contract_Month', 
         'Target Pricing Month': 'Target_Contract_Month', 
@@ -101,6 +100,7 @@ def load_data_engine(paper_file, phys_file):
 
 def calculate_net_positions(df_paper):
     """Step 1: 纸货内部 FIFO 净仓计算"""
+    # 确保按时间排序
     df_paper = df_paper.sort_values(by='Trade Date').reset_index(drop=True)
     df_paper['Group_Key'] = df_paper['Std_Commodity'] + "_" + df_paper['Month']
     
@@ -116,6 +116,8 @@ def calculate_net_positions(df_paper):
         for idx in indices:
             row = records[idx]
             current_vol = row.get('Volume', 0)
+            
+            # 初始化关键字段
             records[idx]['Net_Open_Vol'] = current_vol
             records[idx]['Closed_Vol'] = 0
             records[idx]['Close_Events'] = [] 
@@ -137,6 +139,7 @@ def calculate_net_positions(df_paper):
                     }
                     records[q_idx]['Close_Events'].append(close_event)
                     
+                    # 净额抵消 (减法)
                     current_vol -= (current_sign * offset)
                     q_vol -= (q_sign * offset)
                     
@@ -154,7 +157,7 @@ def calculate_net_positions(df_paper):
             
             if abs(current_vol) > 0.0001:
                 open_queue.append((idx, current_vol, current_sign))
-                
+    
     return pd.DataFrame(records)
 
 def format_close_details(events):
@@ -173,17 +176,20 @@ def format_close_details(events):
     return " -> ".join(details), total_vol
 
 def auto_match_hedges(physical_df, paper_df):
-    """Step 2: 实货匹配 (v20 逻辑)"""
+    """Step 2: 实货匹配 (v19 移植逻辑: 开放式时间 + 优先排序)"""
     hedge_relations = []
     
-    # ！！！关键修复：确保纸货表中存在 Allocated_To_Phy 列，否则 update 会失败！！！
+    # ！！！核心修复：确保 Allocated_To_Phy 存在！！！
     if 'Allocated_To_Phy' not in paper_df.columns:
         paper_df['Allocated_To_Phy'] = 0.0
     
-    # 索引构建
+    # 索引构建 (只取有净敞口的单子)
     active_paper = paper_df[abs(paper_df['Net_Open_Vol']) > 0.0001].copy()
-    # 确保 active_paper 也初始化了该列
-    active_paper['Allocated_To_Phy'] = 0.0 
+    
+    # 再次确保 active_paper 也有这个列 (copy可能会丢)
+    if 'Allocated_To_Phy' not in active_paper.columns:
+        active_paper['Allocated_To_Phy'] = 0.0
+        
     active_paper['_original_index'] = active_paper.index
 
     # 实货排序 (抢单公平性)
@@ -200,7 +206,7 @@ def auto_match_hedges(physical_df, paper_df):
         
         required_open_sign = -1 if 'BUY' in str(phy_dir).upper() else 1
         
-        # 筛选
+        # 筛选：品种 + 月份 + 方向
         mask = (
             (active_paper['Std_Commodity'].str.contains(proxy, regex=False)) & 
             (active_paper['Month'] == target_month) &
@@ -210,9 +216,10 @@ def auto_match_hedges(physical_df, paper_df):
         
         if candidates_df.empty: continue
         
-        # 排序 (Time Lag 优先)
+        # 排序策略 (v19 逻辑)
         if pd.notna(desig_date) and not candidates_df['Trade Date'].isnull().all():
             candidates_df['Time_Lag_Days'] = (candidates_df['Trade Date'] - desig_date).dt.days
+            # 优先匹配 Abs_Lag 最小的 (最接近指定日，不管前后)
             candidates_df['Abs_Lag'] = candidates_df['Time_Lag_Days'].abs()
             candidates_df = candidates_df.sort_values(by=['Abs_Lag', 'Trade Date'])
         else:
@@ -225,6 +232,8 @@ def auto_match_hedges(physical_df, paper_df):
             if abs(phy_vol) < 1: break
             
             orig_idx = ticket['_original_index']
+            
+            # 实时查余额 (关键)
             curr_allocated = active_paper.at[orig_idx, 'Allocated_To_Phy']
             curr_net_open = active_paper.at[orig_idx, 'Net_Open_Vol']
             net_avail = curr_net_open - curr_allocated
@@ -268,9 +277,10 @@ def auto_match_hedges(physical_df, paper_df):
             
         physical_df_sorted.at[idx, 'Unhedged_Volume'] = phy_vol
         
-    # 更新纸货分配状态 (现在 Allocated_To_Phy 肯定存在了)
-    cols_update = active_paper[['_original_index', 'Allocated_To_Phy']].set_index('_original_index')
-    paper_df.update(cols_update)
+    # 回写分配状态到原始 paper_df
+    if not active_paper.empty:
+        cols_update = active_paper[['_original_index', 'Allocated_To_Phy']].set_index('_original_index')
+        paper_df.update(cols_update)
         
     return pd.DataFrame(hedge_relations), physical_df_sorted, paper_df
 
@@ -280,151 +290,109 @@ def auto_match_hedges(physical_df, paper_df):
 
 st.set_page_config(page_title="Hedge Master Analytics", page_icon="📈", layout="wide")
 
-# CSS 样式美化
 st.markdown("""
 <style>
-    .metric-card {
-        background-color: #f0f2f6;
-        border-radius: 10px;
-        padding: 20px;
-        box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-    }
     .stDataFrame { border: 1px solid #ddd; border-radius: 5px; }
 </style>
 """, unsafe_allow_html=True)
 
-# 标题栏
-col_logo, col_title = st.columns([1, 5])
+col_title = st.columns([1])[0]
 with col_title:
     st.title("Hedge Master Analytics 📊")
-    st.markdown("**基于 v20 引擎的智能套保有效性分析系统** | *Designed for Energy Trading*")
+    st.markdown("**基于 v19 引擎的智能套保有效性分析系统** | *Designed for Energy Trading*")
 
 st.divider()
 
-# --- 侧边栏：文件上传 ---
 with st.sidebar:
     st.header("📂 数据接入")
-    st.info("请上传标准格式的 Excel 或 CSV 文件")
-    
     ticket_file = st.file_uploader("上传纸货水单 (Ticket Data)", type=['xlsx', 'csv'])
     phys_file = st.file_uploader("上传实货台账 (Physical Ledger)", type=['xlsx', 'csv'])
-    
     run_btn = st.button("🚀 开始全景分析", type="primary", use_container_width=True)
-    
-    st.markdown("---")
-    st.caption("Core Engine: v20.0 (FIFO + Time Lag Priority)")
+    st.caption("Engine: v19 Logic (Open Match)")
 
-# --- 主逻辑 ---
 if run_btn:
     if ticket_file and phys_file:
-        with st.spinner('正在启动 v20 引擎... 执行 FIFO 净仓计算... 实货智能匹配中...'):
-            # 1. 加载数据
+        with st.spinner('正在运行核心引擎...'):
+            # 1. 加载
             df_p, df_ph = load_data_engine(ticket_file, phys_file)
             
             if not df_ph.empty and not df_p.empty:
-                # 2. 运行计算
+                # 2. 核心计算
                 start_t = time.time()
-                df_p_net = calculate_net_positions(df_p)
-                df_rels, df_ph_final, df_p_final = auto_match_hedges(df_ph, df_p_net)
-                calc_time = time.time() - start_t
                 
+                # Step 1: 净仓计算
+                df_p_net = calculate_net_positions(df_p)
+                
+                # Step 2: 强制初始化 Allocated 列 (修复 KeyError)
+                df_p_net['Allocated_To_Phy'] = 0.0
+                
+                # Step 3: 匹配
+                df_rels, df_ph_final, df_p_final = auto_match_hedges(df_ph, df_p_net)
+                
+                calc_time = time.time() - start_t
                 st.success(f"分析完成！耗时 {calc_time:.2f} 秒")
                 
-                # --- KPI 指标区 ---
+                # --- KPI ---
                 total_exp = df_ph_final['Volume'].abs().sum()
                 unhedged = df_ph_final['Unhedged_Volume'].abs().sum()
                 hedged_vol = total_exp - unhedged
                 coverage = (hedged_vol / total_exp * 100) if total_exp > 0 else 0
-                
-                # 计算总盈亏 (Allocated)
                 total_mtm = df_rels['MTM_PL'].sum() if not df_rels.empty else 0
                 
                 kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-                kpi1.metric("实货总敞口 (Total Exposure)", f"{total_exp:,.0f} BBL")
-                kpi2.metric("套保覆盖率 (Hedge Ratio)", f"{coverage:.1f}%", delta=f"{coverage-100:.1f}%" if coverage<100 else "Perfect")
-                kpi3.metric("风险裸露敞口 (Open Risk)", f"{unhedged:,.0f} BBL", delta_color="inverse")
-                kpi4.metric("套保组合 MTM", f"${total_mtm:,.0f}", delta_color="normal")
+                kpi1.metric("实货总敞口", f"{total_exp:,.0f} BBL")
+                kpi2.metric("套保覆盖率", f"{coverage:.1f}%")
+                kpi3.metric("风险裸露敞口", f"{unhedged:,.0f} BBL")
+                kpi4.metric("套保组合 MTM", f"${total_mtm:,.0f}")
                 
                 st.markdown("---")
 
-                # --- 图表分析区 ---
-                chart_col1, chart_col2 = st.columns([2, 1])
-                
-                with chart_col1:
-                    st.subheader("📅 月度敞口覆盖分析")
+                # --- Charts ---
+                c1, c2 = st.columns([2, 1])
+                with c1:
+                    st.subheader("📅 月度覆盖")
                     if 'Target_Contract_Month' in df_ph_final.columns:
-                        # 聚合数据
                         chart_data = df_ph_final.groupby('Target_Contract_Month')[['Volume', 'Unhedged_Volume']].sum().abs().reset_index()
                         chart_data['Hedged'] = chart_data['Volume'] - chart_data['Unhedged_Volume']
-                        
-                        # Fix: 使用 Plotly 宽模式代替 pd.melt
-                        fig = px.bar(
-                            chart_data, 
-                            x='Target_Contract_Month', 
-                            y=['Hedged', 'Unhedged_Volume'], 
-                            title="Monthly Exposure vs Hedge",
-                            labels={'value': 'Volume', 'variable': 'Type'},
-                            color_discrete_map={'Hedged': '#00CC96', 'Unhedged_Volume': '#EF553B'},
-                            template="plotly_white"
-                        )
+                        fig = px.bar(chart_data, x='Target_Contract_Month', y=['Hedged', 'Unhedged_Volume'], 
+                                     title="Monthly Exposure vs Hedge", template="plotly_white",
+                                     color_discrete_map={'Hedged': '#00CC96', 'Unhedged_Volume': '#EF553B'})
                         st.plotly_chart(fig, use_container_width=True)
-                    else:
-                        st.warning("实货数据缺少 'Target_Contract_Month' 列，无法生成月度图表。")
-
-                with chart_col2:
-                    st.subheader("🍰 风险构成")
-                    pie_data = pd.DataFrame({
-                        'Type': ['Hedged', 'Unhedged'],
-                        'Volume': [hedged_vol, unhedged]
-                    })
-                    fig_pie = px.pie(pie_data, values='Volume', names='Type', hole=0.4,
-                                     color='Type',
-                                     color_discrete_map={'Hedged': '#00CC96', 'Unhedged': '#EF553B'})
+                
+                with c2:
+                    st.subheader("🍰 占比")
+                    fig_pie = px.pie(values=[hedged_vol, unhedged], names=['Hedged', 'Unhedged'], 
+                                     color_discrete_sequence=['#00CC96', '#EF553B'])
                     st.plotly_chart(fig_pie, use_container_width=True)
 
-                # --- 详细数据 Tab 页 ---
-                st.subheader("📋 详细数据账本")
-                tab1, tab2, tab3 = st.tabs(["✅ 匹配明细账本 (Allocation)", "⚠️ 实货剩余敞口 (Unhedged Cargo)", "📦 纸货剩余头寸 (Unmatched Paper)"])
+                # --- Tables ---
+                st.subheader("📋 数据账本")
+                # 修复了 Emoji 语法错误
+                tab1, tab2, tab3 = st.tabs(["✅ 匹配明细", "⚠️ 实货剩余", "📦 纸货剩余"])
                 
                 with tab1:
                     if not df_rels.empty:
                         st.dataframe(df_rels, use_container_width=True)
-                        # 下载按钮
                         csv = df_rels.to_csv(index=False).encode('utf-8')
-                        st.download_button("📥 下载匹配明细 CSV", csv, "hedge_allocation.csv", "text/csv")
+                        st.download_button("📥 下载明细", csv, "hedge_allocation.csv", "text/csv")
                     else:
-                        st.info("没有产生任何匹配记录。")
+                        st.info("无匹配记录")
                         
                 with tab2:
-                    unhedged_df = df_ph_final[abs(df_ph_final['Unhedged_Volume']) > 1]
-                    st.dataframe(unhedged_df, use_container_width=True)
-                    csv_un = unhedged_df.to_csv(index=False).encode('utf-8')
-                    st.download_button("📥 下载风险敞口 CSV", csv_un, "unhedged_cargo.csv", "text/csv")
+                    st.dataframe(df_ph_final[abs(df_ph_final['Unhedged_Volume']) > 1], use_container_width=True)
                     
                 with tab3:
-                    # 计算剩余纸货
-                    # 现在 Allocated_To_Phy 肯定存在了
-                    df_p_final['Implied_Remaining'] = df_p_final['Volume'] - df_p_final['Allocated_To_Phy']
-                    unused_paper = df_p_final[abs(df_p_final['Implied_Remaining']) > 1]
-                    
-                    show_cols = ['Recap No', 'Std_Commodity', 'Month', 'Volume', 'Allocated_To_Phy', 'Implied_Remaining', 'Price']
-                    # 确保列都存在
-                    final_show = [c for c in show_cols if c in unused_paper.columns]
-                    
-                    st.dataframe(unused_paper[final_show], use_container_width=True)
-                    csv_paper = unused_paper[final_show].to_csv(index=False).encode('utf-8')
-                    st.download_button("📥 下载剩余头寸 CSV", csv_paper, "unmatched_paper.csv", "text/csv")
+                    # 修复 KeyError: 确保列存在再计算
+                    if 'Allocated_To_Phy' in df_p_final.columns and 'Volume' in df_p_final.columns:
+                        df_p_final['Implied_Remaining'] = df_p_final['Volume'] - df_p_final['Allocated_To_Phy']
+                        unused = df_p_final[abs(df_p_final['Implied_Remaining']) > 1]
+                        
+                        cols_show = ['Recap No', 'Std_Commodity', 'Month', 'Volume', 'Allocated_To_Phy', 'Implied_Remaining', 'Price']
+                        final_cols = [c for c in cols_show if c in unused.columns]
+                        st.dataframe(unused[final_cols], use_container_width=True)
+                    else:
+                        st.error("数据列丢失，无法计算剩余头寸")
             else:
-                st.error("数据加载后为空，请检查文件格式。")
+                st.error("数据为空")
     else:
-        st.warning("请先在左侧侧边栏上传两个必要文件！")
-else:
-    # 欢迎界面
-    st.info("👋 欢迎使用！请在左侧上传文件并点击运行。")
-    st.markdown("""
-    ### 系统功能说明：
-    1. **FIFO 净仓计算**：自动处理纸货的开平仓逻辑，计算净头寸。
-    2. **时间优先匹配**：优先匹配与实货指定日 (Designation Date) 最接近的纸货单据。
-    3. **财务透视**：自动计算分配部分的 MTM 和盈亏。
-    4. **全景报表**：一站式导出匹配明细、风险敞口和剩余头寸。
-    """)
+        st.warning("请上传文件")
