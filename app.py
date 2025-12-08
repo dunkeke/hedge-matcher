@@ -6,17 +6,13 @@ import time
 import io
 
 # ==============================================================================
-# 导入核心引擎 (模块化调用)
+# 导入核心引擎
 # ==============================================================================
 try:
     import hedge_engine as engine
 except ImportError:
-    st.error("❌ 严重错误: 找不到 hedge_engine.py 模块！请确保该文件在同一目录下。")
+    st.error("❌ 严重错误: 找不到 hedge_engine.py 模块！")
     st.stop()
-
-# ==============================================================================
-# Streamlit UI
-# ==============================================================================
 
 st.set_page_config(page_title="Hedge Master Analytics", page_icon="📈", layout="wide")
 
@@ -31,28 +27,22 @@ st.markdown("""
 col_title = st.columns([1])[0]
 with col_title:
     st.title("Hedge Master Analytics 📊")
-    st.markdown("**基于 v22 引擎 (模块化版) 的智能套保有效性分析系统**")
+    st.markdown("**基于 v19 引擎 (移植版) 的智能套保有效性分析系统**")
 
 st.divider()
 
-# --- 侧边栏 ---
 with st.sidebar:
     st.header("📂 数据接入")
     ticket_file = st.file_uploader("上传纸货水单 (Ticket Data)", type=['xlsx', 'csv'])
     phys_file = st.file_uploader("上传实货台账 (Physical Ledger)", type=['xlsx', 'csv'])
-    
-    st.markdown("---")
     run_btn = st.button("🚀 开始全景分析", type="primary", use_container_width=True)
-    st.caption("Engine: hedge_engine.py v22")
+    st.caption("Engine: v19 Logic (Fix Read Error)")
 
-# --- 主逻辑 ---
 if run_btn:
     if ticket_file and phys_file:
-        with st.spinner('正在调用 hedge_engine 执行计算...'):
+        with st.spinner('正在执行匹配运算...'):
             try:
-                # 1. 加载 (直接传 Streamlit 的 UploadedFile 对象给引擎的 read_file_fast)
-                # 注意：read_file_fast 需要支持 seek(0)
-                # 引擎里的 load_data_v19 调用了 read_file_fast
+                # 1. 加载
                 df_p, df_ph = engine.load_data_v19(ticket_file, phys_file)
                 
                 if not df_ph.empty and not df_p.empty:
@@ -73,7 +63,7 @@ if run_btn:
                     unhedged = df_ph_final['Unhedged_Volume'].abs().sum()
                     hedged_vol = total_exp - unhedged
                     coverage = (hedged_vol / total_exp * 100) if total_exp > 0 else 0
-                    total_mtm = df_rels['MTM_PL'].sum() if not df_rels.empty else 0
+                    total_mtm = df_rels['Alloc_Unrealized_MTM'].sum() if not df_rels.empty else 0
                     
                     kpi1, kpi2, kpi3, kpi4 = st.columns(4)
                     kpi1.metric("实货总敞口", f"{total_exp:,.0f} BBL")
