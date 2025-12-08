@@ -14,77 +14,189 @@ import sys
 # 首先确保能够找到 hedge_engine.py
 sys.path.append(os.path.dirname(__file__))
 
-try:
-    # 重写部分函数以确保兼容性
-    def run_engine_with_fixes(paper_file, phys_file):
-        """
-        包装引擎主函数，确保返回所有需要的值
-        """
-        import hedge_engine as engine
-        
-        # 1. 加载数据
-        df_p, df_ph = engine.load_data_v19(paper_file, phys_file)
-        
-        if not df_ph.empty and not df_p.empty:
-            # 2. 核心计算
-            # Step 1: 净仓
-            df_p_net = engine.calculate_net_positions_corrected(df_p)
-            
-            # Step 2: 匹配 - 注意：原始函数只返回2个值
-            df_rels, df_ph_updated = engine.auto_match_hedges(df_ph, df_p_net)
-            
-            # 我们需要创建一个增强的纸货DataFrame，显示分配情况
-            # 从关系数据中计算每个纸货交易的总分配量
-            if not df_rels.empty:
-                # 按纸货交易分组汇总分配量
-                alloc_summary = df_rels.groupby('Ticket_ID')['Allocated_Vol'].sum().reset_index()
-                alloc_summary.rename(columns={'Allocated_Vol': 'Allocated_To_Phy'}, inplace=True)
-                
-                # 合并到纸货数据
-                df_p_final = df_p_net.copy()
-                if 'Recap No' in df_p_final.columns:
-                    df_p_final = pd.merge(df_p_final, alloc_summary, 
-                                          left_on='Recap No', 
-                                          right_on='Ticket_ID', 
-                                          how='left')
-                    df_p_final['Allocated_To_Phy'] = df_p_final['Allocated_To_Phy'].fillna(0)
-                else:
-                    df_p_final['Allocated_To_Phy'] = 0
-            else:
-                df_p_final = df_p_net.copy()
-                df_p_final['Allocated_To_Phy'] = 0
-            
-            return df_rels, df_ph_updated, df_p_final
-        else:
-            return pd.DataFrame(), df_ph, df_p
+# 创建增强版的读取函数
+def read_file_fast_streamlit(file_obj, file_name):
+    """
+    增强版文件读取函数，支持Streamlit上传的文件对象
+    """
+    # 根据文件名后缀判断格式
+    file_name_lower = file_name.lower()
     
-    # 定义引擎模块的导出函数
-    class EngineWrapper:
-        load_data_v19 = None
-        calculate_net_positions_corrected = None
-        auto_match_hedges = None
-        
-        @staticmethod
-        def run_full_analysis(paper_file, phys_file):
-            return run_engine_with_fixes(paper_file, phys_file)
+    # 如果是Excel文件
+    if file_name_lower.endswith(('.xlsx', '.xls')):
+        try:
+            return pd.read_excel(file_obj)
+        except Exception as e:
+            # 尝试不同的读取方式
+            file_obj.seek(0)  # 重置文件指针
+            try:
+                # 尝试读取第一个sheet
+                return pd.read_excel(file_obj, sheet_name=0)
+            except Exception:
+                file_obj.seek(0)
+                try:
+                    # 尝试读取所有sheet
+                    xls = pd.ExcelFile(file_obj)
+                    return pd.read_excel(xls, sheet_name=xls.sheet_names[0])
+                except Exception as e2:
+                    raise ValueError(f"无法读取Excel文件: {str(e2)}")
     
-    # 尝试导入原始函数
+    # 如果是CSV文件
+    elif file_name_lower.endswith('.csv'):
+        encodings = ['utf-8', 'utf-8-sig', 'gbk', 'gb18030', 'latin1', 'iso-8859-1']
+        for enc in encodings:
+            file_obj.seek(0)  # 重置文件指针
+            try:
+                return pd.read_csv(file_obj, encoding=enc)
+            except Exception:
+                continue
+        
+        # 如果所有编码都失败，尝试自动检测
+        file_obj.seek(0)
+        try:
+            # 使用Python的chardet库尝试检测编码
+            import chardet
+            raw_data = file_obj.read()
+            result = chardet.detect(raw_data)
+            file_obj.seek(0)
+            return pd.read_csv(file_obj, encoding=result['encoding'])
+        except ImportError:
+            # 如果没有chardet，使用最后的手段
+            file_obj.seek(0)
+            try:
+                return pd.read_csv(file_obj, encoding='utf-8', errors='ignore')
+            except Exception as e:
+                raise ValueError(f"无法读取CSV文件: {str(e)}")
+        except Exception as e:
+            raise ValueError(f"无法读取CSV文件: {str(e)}")
+    
+    else:
+        raise ValueError(f"不支持的文件格式: {file_name}")
+
+# 修改load_data_v19函数以使用上传的文件对象
+def load_data_v19_streamlit(paper_file_obj, paper_file_name, phys_file_obj, phys_file_name):
+    """
+    从Streamlit上传的文件对象加载数据
+    """
     import hedge_engine as engine_raw
-    EngineWrapper.load_data_v19 = engine_raw.load_data_v19
-    EngineWrapper.calculate_net_positions_corrected = engine_raw.calculate_net_positions_corrected
-    EngineWrapper.auto_match_hedges = engine_raw.auto_match_hedges
     
-    engine = EngineWrapper
+    # 读取纸货数据
+    df_p = read_file_fast_streamlit(paper_file_obj, paper_file_name)
     
-except ImportError as e:
-    st.error(f"❌ 导入错误: {str(e)}")
-    st.info("请确保 hedge_engine.py 文件在同一目录下")
-    st.stop()
-except Exception as e:
-    st.error(f"❌ 初始化错误: {str(e)}")
-    import traceback
-    st.code(traceback.format_exc())
-    st.stop()
+    # 读取实货数据
+    df_ph = read_file_fast_streamlit(phys_file_obj, phys_file_name)
+    
+    # 使用原始引擎的预处理逻辑
+    # 纸货数据预处理
+    if 'Trade Date' in df_p.columns:
+        df_p['Trade Date'] = pd.to_datetime(df_p['Trade Date'], errors='coerce')
+    
+    df_p['Volume'] = pd.to_numeric(df_p['Volume'], errors='coerce').fillna(0)
+    
+    if 'Commodity' in df_p.columns:
+        df_p['Std_Commodity'] = df_p['Commodity'].astype(str).str.strip().str.upper().replace('NAN', '')
+    elif 'Std_Commodity' in df_p.columns:
+        df_p['Std_Commodity'] = df_p['Std_Commodity'].astype(str).str.strip().str.upper().replace('NAN', '')
+    
+    # 月份标准化
+    if 'Month' in df_p.columns:
+        df_p['Month'] = engine_raw.standardize_month_vectorized(df_p['Month'])
+    else:
+        df_p['Month'] = ''
+    
+    # Recap No 若不存在则用索引代替
+    if 'Recap No' not in df_p.columns:
+        df_p['Recap No'] = df_p.index.astype(str)
+    
+    df_p['_original_index'] = df_p.index
+    
+    # 初始化缺失金融字段
+    for col in ['Price', 'Mtm Price', 'Total P/L']:
+        if col not in df_p.columns:
+            df_p[col] = 0
+    
+    # 实货数据预处理
+    col_map = {'Target_Pricing_Month': 'Target_Contract_Month', 'Month': 'Target_Contract_Month'}
+    df_ph.rename(columns=col_map, inplace=True)
+    
+    df_ph['Volume'] = pd.to_numeric(df_ph['Volume'], errors='coerce').fillna(0)
+    df_ph['Unhedged_Volume'] = df_ph['Volume']
+    
+    if 'Hedge_Proxy' in df_ph.columns:
+        df_ph['Hedge_Proxy'] = df_ph['Hedge_Proxy'].astype(str).str.strip().str.upper().replace('NAN', '')
+    else:
+        df_ph['Hedge_Proxy'] = ''
+    
+    # 合约月标准化
+    if 'Target_Contract_Month' in df_ph.columns:
+        df_ph['Target_Contract_Month'] = engine_raw.standardize_month_vectorized(df_ph['Target_Contract_Month'])
+    
+    # 指定日期
+    date_cols = ['Designation_Date', 'Pricing_Start', 'Trade_Date']
+    date_col_found = None
+    for col in date_cols:
+        if col in df_ph.columns:
+            date_col_found = col
+            break
+    
+    if date_col_found:
+        df_ph['Designation_Date'] = pd.to_datetime(df_ph[date_col_found], errors='coerce')
+    else:
+        df_ph['Designation_Date'] = pd.NaT
+    
+    return df_p, df_ph
+
+def run_engine_with_streamlit(paper_file_obj, paper_file_name, phys_file_obj, phys_file_name):
+    """
+    使用Streamlit文件对象运行引擎
+    """
+    import hedge_engine as engine_raw
+    
+    # 1. 加载数据
+    df_p, df_ph = load_data_v19_streamlit(paper_file_obj, paper_file_name, phys_file_obj, phys_file_name)
+    
+    if not df_ph.empty and not df_p.empty:
+        # 2. 核心计算
+        # Step 1: 净仓
+        df_p_net = engine_raw.calculate_net_positions_corrected(df_p)
+        
+        # Step 2: 匹配
+        df_rels, df_ph_updated = engine_raw.auto_match_hedges(df_ph, df_p_net)
+        
+        # 我们需要创建一个增强的纸货DataFrame，显示分配情况
+        if not df_rels.empty and 'Ticket_ID' in df_rels.columns:
+            # 按纸货交易分组汇总分配量
+            alloc_summary = df_rels.groupby('Ticket_ID')['Allocated_Vol'].sum().reset_index()
+            alloc_summary.rename(columns={'Allocated_Vol': 'Allocated_To_Phy'}, inplace=True)
+            
+            # 合并到纸货数据
+            df_p_final = df_p_net.copy()
+            
+            # 确保Recap No存在
+            if 'Recap No' not in df_p_final.columns:
+                df_p_final['Recap No'] = df_p_final.index.astype(str)
+            
+            # 进行合并
+            df_p_final = pd.merge(
+                df_p_final, 
+                alloc_summary, 
+                left_on='Recap No', 
+                right_on='Ticket_ID', 
+                how='left'
+            )
+            df_p_final['Allocated_To_Phy'] = df_p_final['Allocated_To_Phy'].fillna(0)
+            
+            # 清理临时列
+            if 'Ticket_ID' in df_p_final.columns:
+                df_p_final = df_p_final.drop(columns=['Ticket_ID'])
+        else:
+            df_p_final = df_p_net.copy()
+            df_p_final['Allocated_To_Phy'] = 0
+        
+        return df_rels, df_ph_updated, df_p_final
+    else:
+        # 返回空DataFrame但保持结构
+        return pd.DataFrame(), df_ph, df_p
 
 # ==============================================================================
 # Streamlit 应用界面
@@ -130,6 +242,14 @@ st.markdown("""
         border-radius: 5px;
         margin: 10px 0;
     }
+    .error-message {
+        background-color: #f8d7da;
+        border-color: #f5c6cb;
+        color: #721c24;
+        padding: 15px;
+        border-radius: 5px;
+        margin: 10px 0;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -166,6 +286,15 @@ with st.sidebar:
     
     st.markdown("---")
     
+    # 显示文件信息
+    if ticket_file:
+        st.info(f"📄 纸货文件: {ticket_file.name} ({ticket_file.size:,} bytes)")
+    
+    if phys_file:
+        st.info(f"📦 实货文件: {phys_file.name} ({phys_file.size:,} bytes)")
+    
+    st.markdown("---")
+    
     # 分析选项
     st.subheader("⚙️ 分析选项")
     show_detailed_logs = st.checkbox("显示详细日志", value=True)
@@ -197,27 +326,21 @@ if run_btn and ticket_file and phys_file:
             progress_bar.progress(20)
             time.sleep(0.5)
             
-            # 保存上传的文件到临时位置
-            temp_dir = "temp_uploads"
-            os.makedirs(temp_dir, exist_ok=True)
-            
-            paper_path = os.path.join(temp_dir, "paper_data.csv")
-            phys_path = os.path.join(temp_dir, "physical_data.csv")
-            
-            # 保存上传的文件
-            with open(paper_path, "wb") as f:
-                f.write(ticket_file.getbuffer())
-            
-            with open(phys_path, "wb") as f:
-                f.write(phys_file.getbuffer())
-            
             # 步骤2: 运行引擎
             status_text.text("步骤 2/3: 执行套保匹配引擎...")
             progress_bar.progress(50)
             time.sleep(0.5)
             
             start_t = time.time()
-            df_rels, df_ph_final, df_p_final = engine.run_full_analysis(paper_path, phys_path)
+            
+            # 使用修复版的引擎函数
+            df_rels, df_ph_final, df_p_final = run_engine_with_streamlit(
+                io.BytesIO(ticket_file.getvalue()),
+                ticket_file.name,
+                io.BytesIO(phys_file.getvalue()),
+                phys_file.name
+            )
+            
             calc_time = time.time() - start_t
             
             # 步骤3: 计算结果
@@ -234,13 +357,19 @@ if run_btn and ticket_file and phys_file:
             st.markdown("## 📊 关键指标概览")
             
             # 计算指标
-            if not df_ph_final.empty:
+            if not df_ph_final.empty and 'Volume' in df_ph_final.columns:
                 total_exp = df_ph_final['Volume'].abs().sum()
                 unhedged = df_ph_final['Unhedged_Volume'].abs().sum()
                 hedged_vol = total_exp - unhedged
                 coverage = (hedged_vol / total_exp * 100) if total_exp > 0 else 0
-                total_mtm = df_rels['Alloc_Unrealized_MTM'].sum() if not df_rels.empty else 0
-                total_pl = df_rels['Alloc_Total_PL'].sum() if not df_rels.empty else 0
+                
+                # 计算MTM和PL
+                if not df_rels.empty:
+                    total_mtm = df_rels['Alloc_Unrealized_MTM'].sum() if 'Alloc_Unrealized_MTM' in df_rels.columns else 0
+                    total_pl = df_rels['Alloc_Total_PL'].sum() if 'Alloc_Total_PL' in df_rels.columns else 0
+                else:
+                    total_mtm = 0
+                    total_pl = 0
                 
                 # 匹配交易数量
                 match_count = len(df_rels) if not df_rels.empty else 0
@@ -289,11 +418,11 @@ if run_btn and ticket_file and phys_file:
                 # --- 图表区域 ---
                 st.markdown("## 📈 可视化分析")
                 
-                col_chart1, col_chart2 = st.columns([2, 1])
-                
-                with col_chart1:
-                    st.subheader("📅 月度敞口覆盖情况")
-                    if 'Target_Contract_Month' in df_ph_final.columns:
+                if 'Target_Contract_Month' in df_ph_final.columns:
+                    col_chart1, col_chart2 = st.columns([2, 1])
+                    
+                    with col_chart1:
+                        st.subheader("📅 月度敞口覆盖情况")
                         # 准备图表数据
                         chart_data = df_ph_final.copy()
                         chart_data['Hedged'] = chart_data['Volume'].abs() - chart_data['Unhedged_Volume'].abs()
@@ -306,63 +435,72 @@ if run_btn and ticket_file and phys_file:
                             'Volume': 'sum'
                         }).reset_index()
                         
-                        # 排序月份
-                        monthly_summary = monthly_summary.sort_values('Target_Contract_Month')
+                        # 排序月份（如果可能）
+                        try:
+                            # 尝试转换为日期排序
+                            monthly_summary['Month_Sort'] = pd.to_datetime(monthly_summary['Target_Contract_Month'], format='%b %y', errors='coerce')
+                            monthly_summary = monthly_summary.sort_values('Month_Sort')
+                        except:
+                            # 如果不能转换，按字母排序
+                            monthly_summary = monthly_summary.sort_values('Target_Contract_Month')
                         
-                        fig_bar = px.bar(
-                            monthly_summary, 
-                            x='Target_Contract_Month', 
-                            y=['Hedged', 'Unhedged'], 
-                            title="每月敞口 vs 套保覆盖",
-                            template="plotly_white",
-                            color_discrete_map={
-                                'Hedged': '#2E86AB', 
-                                'Unhedged': '#A23B72'
-                            },
-                            labels={
-                                'value': 'Volume (BBL)',
-                                'Target_Contract_Month': '合约月份',
-                                'variable': '状态'
-                            }
-                        )
-                        fig_bar.update_layout(
-                            hovermode='x unified',
-                            barmode='stack',
-                            legend=dict(
-                                orientation="h",
-                                yanchor="bottom",
-                                y=1.02,
-                                xanchor="right",
-                                x=1
+                        if not monthly_summary.empty:
+                            fig_bar = px.bar(
+                                monthly_summary, 
+                                x='Target_Contract_Month', 
+                                y=['Hedged', 'Unhedged'], 
+                                title="每月敞口 vs 套保覆盖",
+                                template="plotly_white",
+                                color_discrete_map={
+                                    'Hedged': '#2E86AB', 
+                                    'Unhedged': '#A23B72'
+                                },
+                                labels={
+                                    'value': 'Volume (BBL)',
+                                    'Target_Contract_Month': '合约月份',
+                                    'variable': '状态'
+                                }
                             )
-                        )
-                        st.plotly_chart(fig_bar, use_container_width=True)
-                
-                with col_chart2:
-                    st.subheader("📊 套保占比分析")
+                            fig_bar.update_layout(
+                                hovermode='x unified',
+                                barmode='stack',
+                                legend=dict(
+                                    orientation="h",
+                                    yanchor="bottom",
+                                    y=1.02,
+                                    xanchor="right",
+                                    x=1
+                                )
+                            )
+                            st.plotly_chart(fig_bar, use_container_width=True)
                     
-                    # 饼图数据
-                    labels = ['已套保', '未套保']
-                    values = [hedged_vol, unhedged]
-                    
-                    if total_exp > 0:
-                        fig_pie = px.pie(
-                            values=values, 
-                            names=labels,
-                            color_discrete_sequence=['#2E86AB', '#A23B72'],
-                            hole=0.4,
-                            title=f"套保覆盖率: {coverage:.1f}%"
-                        )
-                        fig_pie.update_traces(
-                            textposition='inside', 
-                            textinfo='percent+label',
-                            hovertemplate='<b>%{label}</b><br>' +
-                                        '数量: %{value:,.0f} BBL<br>' +
-                                        '占比: %{percent}'
-                        )
-                        st.plotly_chart(fig_pie, use_container_width=True)
-                    else:
-                        st.info("无敞口数据")
+                    with col_chart2:
+                        st.subheader("📊 套保占比分析")
+                        
+                        # 饼图数据
+                        labels = ['已套保', '未套保']
+                        values = [hedged_vol, unhedged]
+                        
+                        if total_exp > 0:
+                            fig_pie = px.pie(
+                                values=values, 
+                                names=labels,
+                                color_discrete_sequence=['#2E86AB', '#A23B72'],
+                                hole=0.4,
+                                title=f"套保覆盖率: {coverage:.1f}%"
+                            )
+                            fig_pie.update_traces(
+                                textposition='inside', 
+                                textinfo='percent+label',
+                                hovertemplate='<b>%{label}</b><br>' +
+                                            '数量: %{value:,.0f} BBL<br>' +
+                                            '占比: %{percent}'
+                            )
+                            st.plotly_chart(fig_pie, use_container_width=True)
+                        else:
+                            st.info("无敞口数据")
+                else:
+                    st.warning("实货数据中缺少 Target_Contract_Month 列，无法生成月度图表")
                 
                 # --- 数据表格区域 ---
                 st.markdown("---")
@@ -372,30 +510,8 @@ if run_btn and ticket_file and phys_file:
                 
                 with tab1:
                     if not df_rels.empty:
-                        # 选择显示的列
-                        display_cols = [
-                            'Cargo_ID', 'Proxy', 'Designation_Date', 'Open_Date',
-                            'Ticket_ID', 'Month', 'Allocated_Vol',
-                            'Open_Price', 'MTM_Price',
-                            'Alloc_Unrealized_MTM', 'Alloc_Total_PL'
-                        ]
-                        
-                        available_cols = [c for c in display_cols if c in df_rels.columns]
-                        display_df = df_rels[available_cols].copy()
-                        
-                        # 格式化数字显示
-                        numeric_cols = display_df.select_dtypes(include=[np.number]).columns
-                        for col in numeric_cols:
-                            if 'Price' in col or 'MTM' in col or 'PL' in col:
-                                display_df[col] = display_df[col].apply(lambda x: f"${x:,.2f}" if pd.notnull(x) else "")
-                            elif 'Vol' in col:
-                                display_df[col] = display_df[col].apply(lambda x: f"{x:,.0f}" if pd.notnull(x) else "")
-                        
-                        st.dataframe(
-                            display_df, 
-                            use_container_width=True,
-                            height=400
-                        )
+                        # 显示匹配明细
+                        st.dataframe(df_rels, use_container_width=True)
                         
                         # 下载按钮
                         csv = df_rels.to_csv(index=False).encode('utf-8')
@@ -416,26 +532,7 @@ if run_btn and ticket_file and phys_file:
                         
                         if not remaining_phy.empty:
                             st.info(f"还有 {len(remaining_phy)} 笔实货存在未对冲敞口")
-                            
-                            # 选择显示的列
-                            phy_display_cols = [
-                                'Cargo_ID', 'Volume', 'Unhedged_Volume',
-                                'Hedge_Proxy', 'Target_Contract_Month', 'Designation_Date'
-                            ]
-                            
-                            available_phy_cols = [c for c in phy_display_cols if c in remaining_phy.columns]
-                            phy_display_df = remaining_phy[available_phy_cols].copy()
-                            
-                            # 格式化
-                            for col in ['Volume', 'Unhedged_Volume']:
-                                if col in phy_display_df.columns:
-                                    phy_display_df[col] = phy_display_df[col].apply(lambda x: f"{x:,.0f}" if pd.notnull(x) else "")
-                            
-                            st.dataframe(
-                                phy_display_df,
-                                use_container_width=True,
-                                height=300
-                            )
+                            st.dataframe(remaining_phy, use_container_width=True)
                         else:
                             st.success("🎉 所有实货敞口均已完全对冲！")
                     else:
@@ -451,28 +548,7 @@ if run_btn and ticket_file and phys_file:
                         
                         if not remaining_paper.empty:
                             st.info(f"还有 {len(remaining_paper)} 笔纸货交易未完全分配")
-                            
-                            paper_display_cols = [
-                                'Recap No', 'Std_Commodity', 'Month', 
-                                'Volume', 'Allocated_To_Phy', 'Implied_Remaining', 'Price'
-                            ]
-                            
-                            available_paper_cols = [c for c in paper_display_cols if c in remaining_paper.columns]
-                            paper_display_df = remaining_paper[available_paper_cols].copy()
-                            
-                            # 格式化
-                            for col in ['Volume', 'Allocated_To_Phy', 'Implied_Remaining']:
-                                if col in paper_display_df.columns:
-                                    paper_display_df[col] = paper_display_df[col].apply(lambda x: f"{x:,.0f}" if pd.notnull(x) else "")
-                            
-                            if 'Price' in paper_display_df.columns:
-                                paper_display_df['Price'] = paper_display_df['Price'].apply(lambda x: f"${x:,.2f}" if pd.notnull(x) else "")
-                            
-                            st.dataframe(
-                                paper_display_df,
-                                use_container_width=True,
-                                height=300
-                            )
+                            st.dataframe(remaining_paper, use_container_width=True)
                         else:
                             st.success("📊 所有纸货交易均已完全分配！")
                     else:
@@ -547,11 +623,11 @@ MTM估值: ${total_mtm:,.0f}
                     )
                 
             else:
-                st.error("实货数据加载后为空")
+                st.error("实货数据加载后为空或缺少必要列")
                 
         except Exception as e:
             st.error(f"❌ 运行时错误: {str(e)}")
-            st.markdown('<div class="warning-message">错误详情:</div>', unsafe_allow_html=True)
+            st.markdown('<div class="error-message">错误详情:</div>', unsafe_allow_html=True)
             import traceback
             st.code(traceback.format_exc())
             
@@ -559,9 +635,41 @@ MTM估值: ${total_mtm:,.0f}
             st.markdown("""
             1. 检查上传文件格式是否正确
             2. 确保文件包含必要的列名
-            3. 查看原始引擎是否能单独运行
+            3. 查看文件编码是否正确（CSV文件常见问题）
             4. 检查数据中是否有空值或格式错误
             """)
+            
+            # 显示文件预览
+            with st.expander("🔍 查看上传文件预览"):
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.subheader("纸货文件预览")
+                    try:
+                        ticket_file.seek(0)
+                        if ticket_file.name.lower().endswith(('.xlsx', '.xls')):
+                            preview_df = pd.read_excel(ticket_file, nrows=5)
+                        else:
+                            ticket_file.seek(0)
+                            preview_df = pd.read_csv(ticket_file, nrows=5)
+                        st.write(f"形状: {preview_df.shape}")
+                        st.dataframe(preview_df)
+                    except Exception as e:
+                        st.error(f"无法预览: {str(e)}")
+                
+                with col2:
+                    st.subheader("实货文件预览")
+                    try:
+                        phys_file.seek(0)
+                        if phys_file.name.lower().endswith(('.xlsx', '.xls')):
+                            preview_df = pd.read_excel(phys_file, nrows=5)
+                        else:
+                            phys_file.seek(0)
+                            preview_df = pd.read_csv(phys_file, nrows=5)
+                        st.write(f"形状: {preview_df.shape}")
+                        st.dataframe(preview_df)
+                    except Exception as e:
+                        st.error(f"无法预览: {str(e)}")
 else:
     # 显示欢迎界面
     st.markdown("""
