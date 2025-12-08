@@ -1,10 +1,14 @@
-import streamlit as st
 import pandas as pd
+import matplotlib.pyplot as plt
 import numpy as np
+import matplotlib.dates as mdates
 from datetime import datetime
+import matplotlib.ticker as ticker
+import matplotlib.font_manager as fm
 
-st.set_page_config(layout="wide")
-st.title("实货持仓数据分析")
+# 设置中文字体
+plt.rcParams['font.sans-serif'] = ['SimHei', 'Arial Unicode MS', 'DejaVu Sans']
+plt.rcParams['axes.unicode_minus'] = False
 
 # 读取CSV文件
 file_path = 'physical_cargo_ledger.csv'
@@ -16,139 +20,222 @@ df = df.dropna(how='all')
 # 清理列名中的不可见字符
 df.columns = df.columns.str.strip()
 
-st.write("### 数据概览")
-st.write(f"总记录数: {len(df)}")
-st.write(f"数据列: {', '.join(df.columns.tolist())}")
+print("数据列名:", df.columns.tolist())
+print(f"数据行数: {len(df)}")
+print(f"数据预览:")
+print(df.head())
+print("\n数据类型:")
+print(df.dtypes)
 
-# 数据显示选项
-with st.sidebar:
-    st.header("筛选选项")
-    commodity_type = st.multiselect(
-        "选择商品类型",
-        options=df['Commodity_Type'].unique().tolist() if 'Commodity_Type' in df.columns else [],
-        default=df['Commodity_Type'].unique().tolist() if 'Commodity_Type' in df.columns else []
-    )
-    
-    show_raw_data = st.checkbox("显示原始数据")
-
-# 筛选数据
-if 'Commodity_Type' in df.columns and commodity_type:
-    filtered_df = df[df['Commodity_Type'].isin(commodity_type)]
+# 检查是否有数据
+if df.empty:
+    print("数据框为空！")
 else:
-    filtered_df = df
-
-# 确保Volume列是数值类型
-if 'Volume' in filtered_df.columns:
-    filtered_df['Volume'] = pd.to_numeric(filtered_df['Volume'], errors='coerce')
-
-# 解析Target_Pricing_Month
-def parse_target_month(month_str):
-    try:
-        if isinstance(month_str, str):
-            month_str = month_str.strip()
-            # 处理"May 26"这样的格式
-            if ' ' in month_str:
-                parts = month_str.split()
-                month_part = parts[0]
-                year_part = parts[1] if len(parts) > 1 else '26'
-            else:
-                # 处理"26-Jan"这样的格式
-                if '-' in month_str:
-                    parts = month_str.split('-')
-                    if len(parts) == 2:
-                        year_part = parts[0]
-                        month_part = parts[1]
+    # 确保Volume列是数值类型
+    df['Volume'] = pd.to_numeric(df['Volume'], errors='coerce')
+    
+    # 解析日期列
+    date_columns = ['Pricing_Start', 'Pricing_End']
+    for col in date_columns:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors='coerce', format='mixed')
+    
+    # 检查Target_Pricing_Month格式并解析
+    print("\nTarget_Pricing_Month唯一值:")
+    print(df['Target_Pricing_Month'].unique())
+    
+    # 将Target_Pricing_Month转换为月份名称和年份
+    def parse_target_month(month_str):
+        try:
+            # 处理各种格式
+            if isinstance(month_str, str):
+                month_str = month_str.strip()
+                # 处理"May 26"这样的格式
+                if ' ' in month_str:
+                    parts = month_str.split()
+                    month_part = parts[0]
+                    year_part = parts[1] if len(parts) > 1 else '26'
+                else:
+                    # 处理"26-Jan"这样的格式
+                    if '-' in month_str:
+                        parts = month_str.split('-')
+                        if len(parts) == 2:
+                            year_part = parts[0]
+                            month_part = parts[1]
+                        else:
+                            return None
                     else:
                         return None
-                else:
-                    return None
-            
-            # 将月份缩写转换为数字
-            month_dict = {
-                'Jan': 1, 'Feb': 2, 'Mar': 3, 'Apr': 4, 'May': 5, 'Jun': 6,
-                'Jul': 7, 'Aug': 8, 'Sep': 9, 'Oct': 10, 'Nov': 11, 'Dec': 12
-            }
-            
-            if month_part in month_dict:
-                month_num = month_dict[month_part]
-            else:
-                month_dict_full = {
-                    'January': 1, 'February': 2, 'March': 3, 'April': 4,
-                    'May': 5, 'June': 6, 'July': 7, 'August': 8,
-                    'September': 9, 'October': 10, 'November': 11, 'December': 12
-                }
-                if month_part in month_dict_full:
-                    month_num = month_dict_full[month_part]
-                else:
-                    return None
-            
-            year_num = int('20' + year_part) if len(year_part) == 2 else int(year_part)
-            return f"{year_num}-{month_num:02d}"
-        return None
-    except:
-        return None
-
-if 'Target_Pricing_Month' in filtered_df.columns:
-    filtered_df['Target_Month_Parsed'] = filtered_df['Target_Pricing_Month'].apply(parse_target_month)
-
-# 显示统计数据
-st.write("### 统计摘要")
-
-col1, col2, col3 = st.columns(3)
-
-with col1:
-    if 'Commodity_Type' in filtered_df.columns:
-        commodity_counts = filtered_df['Commodity_Type'].value_counts()
-        st.metric("商品类型数量", len(commodity_counts))
-        
-with col2:
-    if 'Cargo_ID' in filtered_df.columns:
-        st.metric("唯一Cargo_ID数量", filtered_df['Cargo_ID'].nunique())
-        
-with col3:
-    if 'Volume' in filtered_df.columns:
-        total_volume = filtered_df['Volume'].sum()
-        st.metric("总持仓量", f"{total_volume:,.0f}")
-
-# 按商品类型显示数据
-if 'Commodity_Type' in filtered_df.columns:
-    for commodity in filtered_df['Commodity_Type'].unique():
-        st.write(f"#### {commodity}")
-        commodity_df = filtered_df[filtered_df['Commodity_Type'] == commodity]
-        
-        # 创建表格展示
-        if 'Target_Month_Parsed' in commodity_df.columns and 'Cargo_ID' in commodity_df.columns:
-            pivot_table = commodity_df.pivot_table(
-                values='Volume' if 'Volume' in commodity_df.columns else None,
-                index='Target_Month_Parsed',
-                columns='Cargo_ID',
-                aggfunc='sum',
-                fill_value=0
-            )
-            
-            if not pivot_table.empty:
-                st.dataframe(pivot_table.style.format("{:,.0f}"), use_container_width=True)
                 
-                # 计算总计
-                totals = pivot_table.sum()
-                st.write(f"**总计:**")
-                for cargo_id, total in totals.items():
-                    st.write(f"- {cargo_id}: {total:,.0f}")
-
-# 显示原始数据
-if show_raw_data:
-    st.write("### 原始数据")
-    st.dataframe(filtered_df, use_container_width=True)
-
-# 下载处理后的数据
-@st.cache_data
-def convert_df_to_csv(df):
-    return df.to_csv(index=False).encode('utf-8')
-
-csv_data = convert_df_to_csv(filtered_df)
-st.download_button(
-    label="下载处理后的数据为CSV",
-    data=csv_data,
-    file_name="processed_cargo_data.csv",
-    mime="text/csv"
-)
+                # 将月份缩写转换为数字
+                month_dict = {
+                    'Jan': 1, 'Feb': 2, 'Mar': 3, 'Apr': 4, 'May': 5, 'Jun': 6,
+                    'Jul': 7, 'Aug': 8, 'Sep': 9, 'Oct': 10, 'Nov': 11, 'Dec': 12
+                }
+                
+                # 尝试从缩写获取月份
+                if month_part in month_dict:
+                    month_num = month_dict[month_part]
+                else:
+                    # 尝试从完整月份名称获取
+                    month_dict_full = {
+                        'January': 1, 'February': 2, 'March': 3, 'April': 4,
+                        'May': 5, 'June': 6, 'July': 7, 'August': 8,
+                        'September': 9, 'October': 10, 'November': 11, 'December': 12
+                    }
+                    if month_part in month_dict_full:
+                        month_num = month_dict_full[month_part]
+                    else:
+                        return None
+                
+                # 处理年份（假设20xx格式）
+                year_num = int('20' + year_part) if len(year_part) == 2 else int(year_part)
+                
+                return datetime(year_num, month_num, 1)
+            return None
+        except Exception as e:
+            print(f"解析'{month_str}'时出错: {e}")
+            return None
+    
+    df['Target_Month_Date'] = df['Target_Pricing_Month'].apply(parse_target_month)
+    
+    # 过滤掉原油数据
+    crude_df = df[df['Commodity_Type'] == 'Crude Oil'].copy()
+    
+    print(f"\n原油数据行数: {len(crude_df)}")
+    
+    if not crude_df.empty:
+        # 按Cargo_ID分组查看数据
+        cargo_groups = crude_df.groupby('Cargo_ID')
+        print(f"\nCargo_ID数量: {len(cargo_groups)}")
+        
+        for cargo_id, group in list(cargo_groups)[:3]:  # 只显示前3个
+            print(f"\nCargo_ID: {cargo_id}")
+            print(f"记录数: {len(group)}")
+            print(group[['Target_Pricing_Month', 'Volume', 'Pricing_Start', 'Pricing_End']].head())
+    
+    # 创建可视化
+    fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+    fig.suptitle('原油实货持仓分析', fontsize=16, fontweight='bold')
+    
+    # 1. 按Target Month的总持仓量（堆积面积图）
+    ax1 = axes[0, 0]
+    if not crude_df.empty and 'Target_Month_Date' in crude_df.columns:
+        # 按月份分组并计算总持仓
+        monthly_volume = crude_df.groupby('Target_Month_Date')['Volume'].sum().sort_index()
+        
+        if not monthly_volume.empty:
+            ax1.fill_between(monthly_volume.index, 0, monthly_volume.values, 
+                            alpha=0.7, color='steelblue', label='总持仓量')
+            ax1.plot(monthly_volume.index, monthly_volume.values, 
+                    color='darkblue', linewidth=2, marker='o')
+            ax1.set_xlabel('目标定价月份')
+            ax1.set_ylabel('持仓量 (BBL)')
+            ax1.set_title('按目标月份的总持仓量')
+            ax1.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+            ax1.xaxis.set_major_locator(mdates.MonthLocator())
+            plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45)
+            ax1.grid(True, alpha=0.3)
+            ax1.legend()
+        else:
+            ax1.text(0.5, 0.5, '无原油数据', ha='center', va='center', transform=ax1.transAxes)
+    else:
+        ax1.text(0.5, 0.5, '无原油数据', ha='center', va='center', transform=ax1.transAxes)
+    
+    # 2. 各Cargo_ID的持仓分布（堆积柱状图）
+    ax2 = axes[0, 1]
+    if not crude_df.empty:
+        # 按Cargo_ID和Target Month分组
+        pivot_table = crude_df.pivot_table(
+            values='Volume', 
+            index='Target_Month_Date',
+            columns='Cargo_ID',
+            aggfunc='sum',
+            fill_value=0
+        ).sort_index()
+        
+        if not pivot_table.empty:
+            # 只取前5个Cargo_ID显示
+            cargo_ids = pivot_table.columns[:5]
+            colors = plt.cm.Set3(np.linspace(0, 1, len(cargo_ids)))
+            
+            bottom = np.zeros(len(pivot_table))
+            for i, cargo_id in enumerate(cargo_ids):
+                if cargo_id in pivot_table.columns:
+                    ax2.bar(pivot_table.index, pivot_table[cargo_id], 
+                           bottom=bottom, label=cargo_id, color=colors[i], alpha=0.8)
+                    bottom += pivot_table[cargo_id].values
+            
+            ax2.set_xlabel('目标定价月份')
+            ax2.set_ylabel('持仓量 (BBL)')
+            ax2.set_title('各Cargo_ID持仓分布（堆积柱状图）')
+            ax2.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+            ax2.xaxis.set_major_locator(mdates.MonthLocator())
+            plt.setp(ax2.xaxis.get_majorticklabels(), rotation=45)
+            ax2.legend(title='Cargo_ID', bbox_to_anchor=(1.05, 1), loc='upper left')
+            ax2.grid(True, alpha=0.3, axis='y')
+        else:
+            ax2.text(0.5, 0.5, '无足够数据', ha='center', va='center', transform=ax2.transAxes)
+    else:
+        ax2.text(0.5, 0.5, '无原油数据', ha='center', va='center', transform=ax2.transAxes)
+    
+    # 3. 按Pricing Benchmark分类（饼图）
+    ax3 = axes[1, 0]
+    if not crude_df.empty:
+        benchmark_volume = crude_df.groupby('Pricing_Benchmark')['Volume'].sum()
+        if not benchmark_volume.empty:
+            colors = ['#ff9999', '#66b3ff', '#99ff99', '#ffcc99']
+            ax3.pie(benchmark_volume.values, labels=benchmark_volume.index, 
+                   autopct='%1.1f%%', colors=colors[:len(benchmark_volume)],
+                   startangle=90, shadow=True)
+            ax3.set_title('按定价基准分类的持仓比例')
+            ax3.axis('equal')
+        else:
+            ax3.text(0.5, 0.5, '无足够数据', ha='center', va='center', transform=ax3.transAxes)
+    else:
+        ax3.text(0.5, 0.5, '无原油数据', ha='center', va='center', transform=ax3.transAxes)
+    
+    # 4. 持仓量时间序列（折线图）
+    ax4 = axes[1, 1]
+    if not crude_df.empty and 'Target_Month_Date' in crude_df.columns:
+        # 按Cargo_ID分组，展示主要Cargo_ID的时间序列
+        major_cargos = crude_df['Cargo_ID'].value_counts().index[:3]
+        
+        for cargo_id in major_cargos:
+            cargo_data = crude_df[crude_df['Cargo_ID'] == cargo_id].sort_values('Target_Month_Date')
+            if not cargo_data.empty and len(cargo_data) > 1:
+                ax4.plot(cargo_data['Target_Month_Date'], cargo_data['Volume'], 
+                        marker='o', linewidth=2, label=cargo_id)
+        
+        ax4.set_xlabel('目标定价月份')
+        ax4.set_ylabel('持仓量 (BBL)')
+        ax4.set_title('主要Cargo_ID持仓量变化趋势')
+        ax4.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+        ax4.xaxis.set_major_locator(mdates.MonthLocator())
+        plt.setp(ax4.xaxis.get_majorticklabels(), rotation=45)
+        ax4.legend()
+        ax4.grid(True, alpha=0.3)
+    else:
+        ax4.text(0.5, 0.5, '无足够数据', ha='center', va='center', transform=ax4.transAxes)
+    
+    plt.tight_layout()
+    plt.show()
+    
+    # 打印统计信息
+    print("\n=== 数据统计 ===")
+    print(f"总记录数: {len(df)}")
+    print(f"原油记录数: {len(crude_df)}")
+    print(f"天然气记录数: {len(df[df['Commodity_Type'] == 'Natural Gas'])}")
+    
+    if not crude_df.empty:
+        print(f"\n原油总持仓量: {crude_df['Volume'].sum():,.0f} BBL")
+        print(f"原油平均单笔持仓: {crude_df['Volume'].mean():,.0f} BBL")
+        print(f"涉及Cargo_ID数量: {crude_df['Cargo_ID'].nunique()}")
+        print(f"定价基准分布:")
+        print(crude_df['Pricing_Benchmark'].value_counts())
+        
+        # 按月份统计
+        if 'Target_Month_Date' in crude_df.columns:
+            print(f"\n按目标月份统计:")
+            monthly_stats = crude_df.groupby(crude_df['Target_Month_Date'].dt.strftime('%Y-%m'))['Volume'].agg(['sum', 'count'])
+            print(monthly_stats)
