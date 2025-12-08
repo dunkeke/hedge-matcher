@@ -176,9 +176,14 @@ def auto_match_hedges(physical_df, paper_df):
     """Step 2: 实货匹配 (v20 逻辑)"""
     hedge_relations = []
     
+    # ！！！关键修复：确保纸货表中存在 Allocated_To_Phy 列，否则 update 会失败！！！
+    if 'Allocated_To_Phy' not in paper_df.columns:
+        paper_df['Allocated_To_Phy'] = 0.0
+    
     # 索引构建
     active_paper = paper_df[abs(paper_df['Net_Open_Vol']) > 0.0001].copy()
-    active_paper['Allocated_To_Phy'] = 0 
+    # 确保 active_paper 也初始化了该列
+    active_paper['Allocated_To_Phy'] = 0.0 
     active_paper['_original_index'] = active_paper.index
 
     # 实货排序 (抢单公平性)
@@ -263,7 +268,7 @@ def auto_match_hedges(physical_df, paper_df):
             
         physical_df_sorted.at[idx, 'Unhedged_Volume'] = phy_vol
         
-    # 更新纸货分配状态
+    # 更新纸货分配状态 (现在 Allocated_To_Phy 肯定存在了)
     cols_update = active_paper[['_original_index', 'Allocated_To_Phy']].set_index('_original_index')
     paper_df.update(cols_update)
         
@@ -352,7 +357,7 @@ if run_btn:
                         chart_data = df_ph_final.groupby('Target_Contract_Month')[['Volume', 'Unhedged_Volume']].sum().abs().reset_index()
                         chart_data['Hedged'] = chart_data['Volume'] - chart_data['Unhedged_Volume']
                         
-                        # Fix: 使用 Plotly 宽模式代替 pd.melt，避免 ValueError
+                        # Fix: 使用 Plotly 宽模式代替 pd.melt
                         fig = px.bar(
                             chart_data, 
                             x='Target_Contract_Month', 
@@ -379,7 +384,6 @@ if run_btn:
 
                 # --- 详细数据 Tab 页 ---
                 st.subheader("📋 详细数据账本")
-                # 修复引号问题
                 tab1, tab2, tab3 = st.tabs(["✅ 匹配明细账本 (Allocation)", "⚠️ 实货剩余敞口 (Unhedged Cargo)", "📦 纸货剩余头寸 (Unmatched Paper)"])
                 
                 with tab1:
@@ -399,9 +403,17 @@ if run_btn:
                     
                 with tab3:
                     # 计算剩余纸货
+                    # 现在 Allocated_To_Phy 肯定存在了
                     df_p_final['Implied_Remaining'] = df_p_final['Volume'] - df_p_final['Allocated_To_Phy']
                     unused_paper = df_p_final[abs(df_p_final['Implied_Remaining']) > 1]
-                    st.dataframe(unused_paper[['Recap No', 'Std_Commodity', 'Month', 'Volume', 'Allocated_To_Phy', 'Implied_Remaining', 'Price']], use_container_width=True)
+                    
+                    show_cols = ['Recap No', 'Std_Commodity', 'Month', 'Volume', 'Allocated_To_Phy', 'Implied_Remaining', 'Price']
+                    # 确保列都存在
+                    final_show = [c for c in show_cols if c in unused_paper.columns]
+                    
+                    st.dataframe(unused_paper[final_show], use_container_width=True)
+                    csv_paper = unused_paper[final_show].to_csv(index=False).encode('utf-8')
+                    st.download_button("📥 下载剩余头寸 CSV", csv_paper, "unmatched_paper.csv", "text/csv")
             else:
                 st.error("数据加载后为空，请检查文件格式。")
     else:
