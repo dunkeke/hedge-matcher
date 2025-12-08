@@ -11,7 +11,7 @@ import warnings
 warnings.filterwarnings("ignore")
 
 # ==============================================================================
-# 1. 核心计算引擎 (v21 Core Engine - Robust & Safe)
+# 1. 核心计算引擎 (直接移植自验证过的 hedge_engine.py)
 # ==============================================================================
 
 def clean_str(series):
@@ -19,7 +19,7 @@ def clean_str(series):
     return series.astype(str).str.strip().str.upper().replace('NAN', '')
 
 def standardize_month_vectorized(series):
-    """批量标准化月份格式 (DEC 25)"""
+    """批量标准化月份格式"""
     s = series.astype(str).str.strip().str.upper()
     s = s.replace('NAN', '')
     s = s.str.replace('-', ' ', regex=False).str.replace('/', ' ', regex=False)
@@ -27,36 +27,47 @@ def standardize_month_vectorized(series):
     return dates.dt.strftime('%b %y').str.upper().fillna(s)
 
 def load_data_engine(paper_file, phys_file):
-    """数据加载引擎 (带重试机制)"""
+    """数据加载引擎 (增强版，带详细日志)"""
+    debug_logs = []
     try:
-        # 读取纸货
+        # --- 读取纸货 ---
+        # 重置指针，防止多次读取导致为空
+        paper_file.seek(0)
         if paper_file.name.endswith(('.xlsx', '.xls')):
             df_p = pd.read_excel(paper_file)
         else:
-            try:
-                df_p = pd.read_csv(paper_file)
-            except:
-                paper_file.seek(0) # 关键：重置指针
-                df_p = pd.read_csv(paper_file, encoding='gbk')
-
-        # 读取实货
+            # CSV 编码轮询
+            encodings = ['utf-8', 'gbk', 'gb18030', 'latin1']
+            for enc in encodings:
+                try:
+                    paper_file.seek(0)
+                    df_p = pd.read_csv(paper_file, encoding=enc)
+                    debug_logs.append(f"纸货读取成功 (编码: {enc})")
+                    break
+                except:
+                    continue
+        
+        # --- 读取实货 ---
+        phys_file.seek(0)
         if phys_file.name.endswith(('.xlsx', '.xls')):
             df_ph = pd.read_excel(phys_file)
         else:
-            try:
-                df_ph = pd.read_csv(phys_file)
-            except:
-                phys_file.seek(0) # 关键：重置指针
-                df_ph = pd.read_csv(phys_file, encoding='gbk')
-    except Exception as e:
-        st.error(f"文件读取失败: {e}")
-        return pd.DataFrame(), pd.DataFrame()
+            encodings = ['utf-8', 'gbk', 'gb18030', 'latin1']
+            for enc in encodings:
+                try:
+                    phys_file.seek(0)
+                    df_ph = pd.read_csv(phys_file, encoding=enc)
+                    debug_logs.append(f"实货读取成功 (编码: {enc})")
+                    break
+                except:
+                    continue
 
-    # --- 清除列名空格 ---
-    df_p.columns = df_p.columns.str.strip()
-    df_ph.columns = df_ph.columns.str.strip()
+    except Exception as e:
+        return pd.DataFrame(), pd.DataFrame(), [f"读取严重错误: {str(e)}"]
 
     # --- 纸货清洗 ---
+    df_p.columns = df_p.columns.str.strip()
+    # 关键：强制转换日期，无效转NaT
     df_p['Trade Date'] = pd.to_datetime(df_p['Trade Date'], errors='coerce')
     df_p['Volume'] = pd.to_numeric(df_p['Volume'], errors='coerce').fillna(0)
     df_p['Std_Commodity'] = clean_str(df_p['Commodity'])
@@ -74,6 +85,7 @@ def load_data_engine(paper_file, phys_file):
         if col not in df_p.columns: df_p[col] = 0
 
     # --- 实货清洗 ---
+    df_ph.columns = df_ph.columns.str.strip()
     col_map = {
         'Target_Pricing_Month': 'Target_Contract_Month', 
         'Target Pricing Month': 'Target_Contract_Month', 
@@ -89,19 +101,21 @@ def load_data_engine(paper_file, phys_file):
     if 'Target_Contract_Month' in df_ph.columns:
         df_ph['Target_Contract_Month'] = standardize_month_vectorized(df_ph['Target_Contract_Month'])
     
-    # 处理指定日
+    # 处理指定日 (Designation_Date)
+    # 优先找 Designation_Date，没有则找 Pricing_Start
     if 'Designation_Date' in df_ph.columns:
         df_ph['Designation_Date'] = pd.to_datetime(df_ph['Designation_Date'], errors='coerce')
     elif 'Pricing_Start' in df_ph.columns:
         df_ph['Designation_Date'] = pd.to_datetime(df_ph['Pricing_Start'], errors='coerce')
+        debug_logs.append("提示: 使用 Pricing_Start 作为 指定日")
     else:
         df_ph['Designation_Date'] = pd.NaT
+        debug_logs.append("警告: 未找到指定日列 (Designation_Date 或 Pricing_Start)")
 
-    return df_p, df_ph
+    return df_p, df_ph, debug_logs
 
 def calculate_net_positions(df_paper):
-    """Step 1: 纸货内部 FIFO 净仓计算"""
-    # 确保按时间排序
+    """Step 1: 纸货内部 FIFO 净仓计算 (移植自 hedge_engine.py)"""
     df_paper = df_paper.sort_values(by='Trade Date').reset_index(drop=True)
     df_paper['Group_Key'] = df_paper['Std_Commodity'] + "_" + df_paper['Month']
     
@@ -118,7 +132,6 @@ def calculate_net_positions(df_paper):
             row = records[idx]
             current_vol = row.get('Volume', 0)
             
-            # 初始化关键字段
             records[idx]['Net_Open_Vol'] = current_vol
             records[idx]['Closed_Vol'] = 0
             records[idx]['Close_Events'] = [] 
@@ -131,7 +144,6 @@ def calculate_net_positions(df_paper):
                 if q_sign != current_sign:
                     offset = min(abs(current_vol), abs(q_vol))
                     
-                    # 记录平仓事件
                     close_event = {
                         'Ref': str(records[idx].get('Recap No', '')),
                         'Date': records[idx].get('Trade Date'),
@@ -140,7 +152,6 @@ def calculate_net_positions(df_paper):
                     }
                     records[q_idx]['Close_Events'].append(close_event)
                     
-                    # 净额抵消 (减法)
                     current_vol -= (current_sign * offset)
                     q_vol -= (q_sign * offset)
                     
@@ -177,18 +188,18 @@ def format_close_details(events):
     return " -> ".join(details), total_vol
 
 def auto_match_hedges(physical_df, paper_df):
-    """Step 2: 实货匹配 (Safe Update Version)"""
+    """Step 2: 实货匹配 (v19 开放式逻辑移植)"""
     hedge_relations = []
     
-    # 强制初始化，防止 KeyError
+    # 1. 确保回写列存在
     paper_df['Allocated_To_Phy'] = 0.0
     
-    # 索引构建 (只取有净敞口的单子)
+    # 2. 建立索引 (只取有净敞口的单子)
     active_paper = paper_df[abs(paper_df['Net_Open_Vol']) > 0.0001].copy()
     active_paper['Allocated_To_Phy'] = 0.0
-    active_paper['_original_index'] = active_paper.index
+    active_paper['_original_index'] = active_paper.index # 保留原始索引
 
-    # 实货排序 (抢单公平性)
+    # 3. 实货排序 (Time Priority)
     physical_df['Sort_Date'] = physical_df['Designation_Date'].fillna(pd.Timestamp.max)
     physical_df_sorted = physical_df.sort_values(by=['Sort_Date', 'Cargo_ID'])
 
@@ -202,7 +213,7 @@ def auto_match_hedges(physical_df, paper_df):
         
         required_open_sign = -1 if 'BUY' in str(phy_dir).upper() else 1
         
-        # 筛选：品种 + 月份 + 方向
+        # 筛选: 品种 + 月份 + 方向
         mask = (
             (active_paper['Std_Commodity'].str.contains(proxy, regex=False)) & 
             (active_paper['Month'] == target_month) &
@@ -212,7 +223,7 @@ def auto_match_hedges(physical_df, paper_df):
         
         if candidates_df.empty: continue
         
-        # 排序策略 (v19 开放式匹配: Abs_Lag 最小优先)
+        # 排序策略 (v19: Abs_Lag 优先)
         if pd.notna(desig_date) and not candidates_df['Trade Date'].isnull().all():
             candidates_df['Time_Lag_Days'] = (candidates_df['Trade Date'] - desig_date).dt.days
             candidates_df['Abs_Lag'] = candidates_df['Time_Lag_Days'].abs()
@@ -228,14 +239,12 @@ def auto_match_hedges(physical_df, paper_df):
             
             orig_idx = ticket['_original_index']
             
-            # 实时查余额
             curr_allocated = active_paper.at[orig_idx, 'Allocated_To_Phy']
             curr_net_open = active_paper.at[orig_idx, 'Net_Open_Vol']
             net_avail = curr_net_open - curr_allocated
             
             if abs(net_avail) < 0.0001: continue
             
-            # 分配量
             if abs(net_avail) >= abs(phy_vol):
                 alloc_amt = (1 if net_avail > 0 else -1) * abs(phy_vol)
             else:
@@ -251,7 +260,6 @@ def auto_match_hedges(physical_df, paper_df):
             close_path, _ = format_close_details(ticket.get('Close_Events', []))
             
             unrealized_mtm = (mtm_price - open_price) * alloc_amt
-            
             ratio = 0
             if abs(ticket.get('Volume', 0)) > 0:
                 ratio = abs(alloc_amt) / abs(ticket['Volume'])
@@ -272,22 +280,22 @@ def auto_match_hedges(physical_df, paper_df):
             
         physical_df_sorted.at[idx, 'Unhedged_Volume'] = phy_vol
         
-    # --- 安全回写分配量 ---
+    # 回写分配状态 (Safe Map)
     if not active_paper.empty:
-        # 使用 map 进行回写，比 update 更稳健
-        alloc_series = active_paper.set_index('_original_index')['Allocated_To_Phy']
-        paper_df['Allocated_To_Phy'] = paper_df.index.map(alloc_series).fillna(0.0)
+        alloc_map = active_paper.set_index('_original_index')['Allocated_To_Phy']
+        paper_df['Allocated_To_Phy'] = paper_df.index.map(alloc_map).fillna(0.0)
     else:
         paper_df['Allocated_To_Phy'] = 0.0
         
     return pd.DataFrame(hedge_relations), physical_df_sorted, paper_df
 
 # ==============================================================================
-# 2. Streamlit UI 界面逻辑
+# 2. Streamlit UI
 # ==============================================================================
 
 st.set_page_config(page_title="Hedge Master Analytics", page_icon="📈", layout="wide")
 
+# CSS
 st.markdown("""
 <style>
     .stDataFrame { border: 1px solid #ddd; border-radius: 5px; }
@@ -297,7 +305,7 @@ st.markdown("""
 col_title = st.columns([1])[0]
 with col_title:
     st.title("Hedge Master Analytics 📊")
-    st.markdown("**基于 v21 引擎 (Robust) 的智能套保有效性分析系统** | *Designed for Energy Trading*")
+    st.markdown("**基于 v22 引擎 (移植版) 的智能套保有效性分析系统**")
 
 st.divider()
 
@@ -306,26 +314,36 @@ with st.sidebar:
     ticket_file = st.file_uploader("上传纸货水单 (Ticket Data)", type=['xlsx', 'csv'])
     phys_file = st.file_uploader("上传实货台账 (Physical Ledger)", type=['xlsx', 'csv'])
     run_btn = st.button("🚀 开始全景分析", type="primary", use_container_width=True)
-    st.caption("Engine: v21 Logic (Fix Key Error)")
+    st.caption("Engine: Ported from Working Script")
 
 if run_btn:
     if ticket_file and phys_file:
-        with st.spinner('正在运行核心引擎...'):
+        with st.spinner('正在执行匹配运算...'):
             # 1. 加载
-            df_p, df_ph = load_data_engine(ticket_file, phys_file)
+            df_p, df_ph, logs = load_data_engine(ticket_file, phys_file)
             
+            # --- 🕵️‍♂️ 数据侦探 (调试面板) ---
+            with st.expander("🕵️‍♂️ 数据侦探 (查看数据加载情况)"):
+                st.write("日志:", logs)
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.write(f"实货记录数: {len(df_ph)}")
+                    if not df_ph.empty:
+                        st.write("实货月份示例:", df_ph['Target_Contract_Month'].unique()[:5])
+                        st.write("实货指定日示例:", df_ph['Designation_Date'].dt.date.unique()[:5])
+                with c2:
+                    st.write(f"纸货记录数: {len(df_p)}")
+                    if not df_p.empty:
+                        st.write("纸货月份示例:", df_p['Month'].unique()[:5])
+                        
             if not df_ph.empty and not df_p.empty:
                 # 2. 核心计算
                 start_t = time.time()
-                
-                # Step 1: 净仓计算
                 df_p_net = calculate_net_positions(df_p)
-                
-                # Step 2: 匹配
                 df_rels, df_ph_final, df_p_final = auto_match_hedges(df_ph, df_p_net)
-                
                 calc_time = time.time() - start_t
-                st.success(f"分析完成！耗时 {calc_time:.2f} 秒")
+                
+                st.success(f"分析完成！耗时 {calc_time:.2f} 秒，生成 {len(df_rels)} 条匹配记录")
                 
                 # --- KPI ---
                 total_exp = df_ph_final['Volume'].abs().sum()
@@ -362,32 +380,27 @@ if run_btn:
 
                 # --- Tables ---
                 st.subheader("📋 数据账本")
-                # 修复引号
                 tab1, tab2, tab3 = st.tabs(["✅ 匹配明细", "⚠️ 实货剩余", "📦 纸货剩余"])
                 
                 with tab1:
-                    if not df_rels.empty and len(df_rels) > 0:
+                    if not df_rels.empty:
                         st.dataframe(df_rels, use_container_width=True)
                         csv = df_rels.to_csv(index=False).encode('utf-8')
                         st.download_button("📥 下载明细", csv, "hedge_allocation.csv", "text/csv")
                     else:
-                        st.info("无匹配记录 (请检查实货Proxy和纸货Commodity名称是否包含关系)")
+                        st.info("无匹配记录")
                         
                 with tab2:
                     st.dataframe(df_ph_final[abs(df_ph_final['Unhedged_Volume']) > 1], use_container_width=True)
                     
                 with tab3:
-                    # 容错：防止 Allocated_To_Phy 列依然丢失
-                    if 'Allocated_To_Phy' not in df_p_final.columns:
-                        df_p_final['Allocated_To_Phy'] = 0.0
-                    
-                    df_p_final['Implied_Remaining'] = df_p_final['Volume'] - df_p_final['Allocated_To_Phy']
-                    unused = df_p_final[abs(df_p_final['Implied_Remaining']) > 1]
-                    
-                    cols_show = ['Recap No', 'Std_Commodity', 'Month', 'Volume', 'Allocated_To_Phy', 'Implied_Remaining', 'Price']
-                    final_cols = [c for c in cols_show if c in unused.columns]
-                    st.dataframe(unused[final_cols], use_container_width=True)
+                    if 'Allocated_To_Phy' in df_p_final.columns:
+                        df_p_final['Implied_Remaining'] = df_p_final['Volume'] - df_p_final['Allocated_To_Phy']
+                        unused = df_p_final[abs(df_p_final['Implied_Remaining']) > 1]
+                        cols_show = ['Recap No', 'Std_Commodity', 'Month', 'Volume', 'Allocated_To_Phy', 'Implied_Remaining', 'Price']
+                        final_cols = [c for c in cols_show if c in unused.columns]
+                        st.dataframe(unused[final_cols], use_container_width=True)
             else:
-                st.error("数据加载为空，请检查文件编码或格式 (支持 .xlsx, .csv)")
+                st.error("数据加载后为空")
     else:
         st.warning("请上传文件")
