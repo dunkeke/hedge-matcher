@@ -7,13 +7,11 @@ import io
 import os
 import sys
 import tempfile
+import importlib
 
 # ==============================================================================
-# 直接使用原始引擎
+# Streamlit 应用界面
 # ==============================================================================
-
-# 首先确保能够找到 hedge_engine.py
-sys.path.append(os.path.dirname(__file__))
 
 st.set_page_config(page_title="Hedge Master Analytics", page_icon="📈", layout="wide")
 
@@ -142,7 +140,7 @@ if run_btn and ticket_file and phys_file:
             paper_path = os.path.join(temp_dir, "paper_data.csv")
             phys_path = os.path.join(temp_dir, "phys_data.csv")
             
-            # 保存上传的文件
+            # 保存上传的文件（保持原始格式）
             with open(paper_path, "wb") as f:
                 f.write(ticket_file.getvalue())
             
@@ -155,11 +153,39 @@ if run_btn and ticket_file and phys_file:
             
             start_t = time.time()
             
-            # 导入原始引擎
-            import hedge_engine as engine
+            # 动态导入引擎模块
+            sys.path.append(os.path.dirname(__file__))
             
-            # 直接运行原始引擎的主函数
-            engine.main(paper_path, phys_path)
+            # 尝试不同的导入方式
+            try:
+                # 方法1: 直接导入
+                import hedge_engine as engine
+                
+                # 检查是否有main函数
+                if hasattr(engine, 'main'):
+                    # 运行main函数
+                    engine.main(paper_path, phys_path)
+                else:
+                    # 方法2: 手动调用引擎函数
+                    st.info("使用手动调用引擎函数...")
+                    
+                    # 加载数据
+                    df_paper, df_physical = engine.load_data_v19(paper_path, phys_path)
+                    
+                    if not df_physical.empty:
+                        # 先内部净额化纸货
+                        df_paper_net = engine.calculate_net_positions_corrected(df_paper)
+                        # 实货匹配
+                        df_rels, df_physical_updated = engine.auto_match_hedges(df_physical, df_paper_net)
+                        
+                        # 导出结果
+                        engine.export_results(df_rels)
+                    else:
+                        st.warning("实货文件为空")
+                        
+            except ImportError as e:
+                st.error(f"无法导入引擎模块: {e}")
+                st.stop()
             
             calc_time = time.time() - start_t
             
@@ -168,11 +194,20 @@ if run_btn and ticket_file and phys_file:
             progress_bar.progress(90)
             
             # 检查输出文件
-            output_file = "hedge_allocation_v19_optimized.csv"
-            if os.path.exists(output_file):
-                df_rels = pd.read_csv(output_file)
-            else:
-                df_rels = pd.DataFrame()
+            output_files = [
+                "hedge_allocation_v19_optimized.csv",
+                "hedge_allocation_details.csv",
+                os.path.join(temp_dir, "output.csv")
+            ]
+            
+            df_rels = pd.DataFrame()
+            output_file_path = None
+            
+            for file_path in output_files:
+                if os.path.exists(file_path):
+                    df_rels = pd.read_csv(file_path)
+                    output_file_path = file_path
+                    break
             
             # 重新加载原始数据用于分析
             ticket_file.seek(0)
@@ -200,6 +235,11 @@ if run_btn and ticket_file and phys_file:
             if not df_rels.empty:
                 st.success(f"✅ 成功匹配 {len(df_rels)} 笔交易")
                 
+                # 显示关键指标
+                if 'Allocated_Vol' in df_rels.columns:
+                    total_allocated = df_rels['Allocated_Vol'].abs().sum()
+                    st.metric("总匹配量", f"{total_allocated:,.0f} BBL")
+                
                 # 显示匹配结果
                 st.dataframe(df_rels, use_container_width=True)
                 
@@ -212,13 +252,39 @@ if run_btn and ticket_file and phys_file:
                     mime="text/csv",
                     use_container_width=True
                 )
+                
+                # 显示匹配统计
+                st.markdown("### 📈 匹配统计")
+                
+                col1, col2, col3, col4 = st.columns(4)
+                
+                with col1:
+                    if 'Proxy' in df_rels.columns:
+                        unique_proxies = df_rels['Proxy'].nunique()
+                        st.metric("涉及品种", unique_proxies)
+                
+                with col2:
+                    if 'Month' in df_rels.columns:
+                        unique_months = df_rels['Month'].nunique()
+                        st.metric("涉及合约月", unique_months)
+                
+                with col3:
+                    if 'Alloc_Unrealized_MTM' in df_rels.columns:
+                        total_mtm = df_rels['Alloc_Unrealized_MTM'].sum()
+                        st.metric("总MTM", f"${total_mtm:,.0f}")
+                
+                with col4:
+                    if 'Alloc_Total_PL' in df_rels.columns:
+                        total_pl = df_rels['Alloc_Total_PL'].sum()
+                        st.metric("总P/L", f"${total_pl:,.0f}")
+                
             else:
                 st.warning("⚠️ 引擎未产生匹配结果")
                 
                 # 显示数据预览以帮助调试
                 st.markdown("## 🔍 数据预览与调试")
                 
-                tab1, tab2 = st.tabs(["📄 纸货数据", "📦 实货数据"])
+                tab1, tab2, tab3 = st.tabs(["📄 纸货数据", "📦 实货数据", "🔧 匹配诊断"])
                 
                 with tab1:
                     st.subheader("纸货数据预览")
@@ -229,14 +295,32 @@ if run_btn and ticket_file and phys_file:
                     # 显示关键列
                     st.subheader("关键列检查")
                     required_cols = ['Trade Date', 'Commodity', 'Month', 'Volume', 'Price']
-                    missing_cols = [col for col in required_cols if col not in df_p_original.columns]
                     
-                    if missing_cols:
-                        st.error(f"缺失列: {missing_cols}")
-                        st.info("可用列:")
-                        st.write(list(df_p_original.columns))
-                    else:
-                        st.success("所有关键列都存在")
+                    # 尝试查找列名（不区分大小写）
+                    col_mapping = {}
+                    available_cols = list(df_p_original.columns)
+                    
+                    for req_col in required_cols:
+                        found = False
+                        # 精确匹配
+                        if req_col in available_cols:
+                            col_mapping[req_col] = req_col
+                            found = True
+                        else:
+                            # 尝试不区分大小写匹配
+                            req_lower = req_col.lower()
+                            for avail_col in available_cols:
+                                if avail_col.lower() == req_lower:
+                                    col_mapping[req_col] = avail_col
+                                    found = True
+                                    break
+                        
+                        if not found:
+                            st.error(f"缺失列: {req_col}")
+                    
+                    if len(col_mapping) == len(required_cols):
+                        st.success("所有关键列都存在（或通过映射找到）")
+                        st.write("列映射:", col_mapping)
                         
                         # 显示数据摘要
                         st.subheader("数据摘要")
@@ -244,11 +328,20 @@ if run_btn and ticket_file and phys_file:
                         with col1:
                             st.metric("总交易数", len(df_p_original))
                         with col2:
-                            total_volume = df_p_original['Volume'].sum() if 'Volume' in df_p_original.columns else 0
-                            st.metric("总交易量", f"{total_volume:,.0f} BBL")
+                            vol_col = col_mapping.get('Volume', 'Volume')
+                            if vol_col in df_p_original.columns:
+                                total_volume = df_p_original[vol_col].sum()
+                                st.metric("总交易量", f"{total_volume:,.0f} BBL")
                         with col3:
-                            unique_months = df_p_original['Month'].nunique() if 'Month' in df_p_original.columns else 0
-                            st.metric("合约月份数", unique_months)
+                            month_col = col_mapping.get('Month', 'Month')
+                            if month_col in df_p_original.columns:
+                                unique_months = df_p_original[month_col].nunique()
+                                st.metric("合约月份数", unique_months)
+                                
+                                # 显示月份分布
+                                st.write("月份分布:")
+                                month_counts = df_p_original[month_col].value_counts().head(10)
+                                st.dataframe(month_counts)
                 
                 with tab2:
                     st.subheader("实货数据预览")
@@ -259,34 +352,32 @@ if run_btn and ticket_file and phys_file:
                     # 显示关键列
                     st.subheader("关键列检查")
                     required_cols = ['Cargo_ID', 'Volume', 'Hedge_Proxy', 'Target_Contract_Month']
-                    missing_cols = [col for col in required_cols if col not in df_ph_original.columns]
                     
-                    if missing_cols:
-                        st.error(f"缺失列: {missing_cols}")
-                        st.info("可用列:")
-                        st.write(list(df_ph_original.columns))
+                    # 尝试查找列名（不区分大小写）
+                    col_mapping = {}
+                    available_cols = list(df_ph_original.columns)
+                    
+                    for req_col in required_cols:
+                        found = False
+                        # 精确匹配
+                        if req_col in available_cols:
+                            col_mapping[req_col] = req_col
+                            found = True
+                        else:
+                            # 尝试不区分大小写匹配
+                            req_lower = req_col.lower()
+                            for avail_col in available_cols:
+                                if avail_col.lower() == req_lower:
+                                    col_mapping[req_col] = avail_col
+                                    found = True
+                                    break
                         
-                        # 尝试查找替代列名
-                        st.subheader("列名映射建议")
-                        col_mapping = {
-                            'Cargo_ID': ['Cargo_ID', 'ID', 'CargoID', '货号'],
-                            'Volume': ['Volume', '数量', 'volume', 'VOLUME'],
-                            'Hedge_Proxy': ['Hedge_Proxy', 'Proxy', '对冲代理', '品种'],
-                            'Target_Contract_Month': ['Target_Contract_Month', 'Month', '合约月', '目标月份']
-                        }
-                        
-                        for target_col, possible_names in col_mapping.items():
-                            if target_col not in df_ph_original.columns:
-                                found = False
-                                for name in possible_names:
-                                    if name in df_ph_original.columns:
-                                        st.info(f"建议将 '{name}' 重命名为 '{target_col}'")
-                                        found = True
-                                        break
-                                if not found:
-                                    st.warning(f"未找到 '{target_col}' 的替代列")
-                    else:
-                        st.success("所有关键列都存在")
+                        if not found:
+                            st.error(f"缺失列: {req_col}")
+                    
+                    if len(col_mapping) >= 3:  # 至少需要大部分关键列
+                        st.success("关键列检查通过")
+                        st.write("列映射:", col_mapping)
                         
                         # 显示数据摘要
                         st.subheader("数据摘要")
@@ -294,25 +385,60 @@ if run_btn and ticket_file and phys_file:
                         with col1:
                             st.metric("实货笔数", len(df_ph_original))
                         with col2:
-                            total_volume = df_ph_original['Volume'].sum()
-                            st.metric("总敞口", f"{total_volume:,.0f} BBL")
+                            vol_col = col_mapping.get('Volume', 'Volume')
+                            if vol_col in df_ph_original.columns:
+                                total_volume = df_ph_original[vol_col].sum()
+                                st.metric("总敞口", f"{total_volume:,.0f} BBL")
                         with col3:
-                            unique_proxies = df_ph_original['Hedge_Proxy'].nunique()
-                            st.metric("对冲品种数", unique_proxies)
+                            proxy_col = col_mapping.get('Hedge_Proxy', 'Hedge_Proxy')
+                            if proxy_col in df_ph_original.columns:
+                                unique_proxies = df_ph_original[proxy_col].nunique()
+                                st.metric("对冲品种数", unique_proxies)
+                                
+                                # 显示品种分布
+                                st.write("品种分布:")
+                                proxy_counts = df_ph_original[proxy_col].value_counts().head(10)
+                                st.dataframe(proxy_counts)
+                
+                with tab3:
+                    st.subheader("匹配诊断")
+                    st.markdown("""
+                    ### 可能的原因:
+                    
+                    1. **品种不匹配**: 纸货的 `Commodity` 和实货的 `Hedge_Proxy` 不一致
+                    2. **月份不匹配**: 纸货的 `Month` 和实货的 `Target_Contract_Month` 不一致
+                    3. **数据格式问题**: 日期或数字格式不正确
+                    4. **方向不匹配**: 买卖方向不一致
+                    
+                    ### 解决方案:
+                    
+                    1. **检查品种名称**: 确保大小写一致（引擎会自动转换为大写）
+                    2. **检查月份格式**: 确保都是标准格式如 `JAN 24`
+                    3. **检查数据完整性**: 确保没有空值或错误数据
+                    4. **检查文件编码**: 确保文件编码正确
+                    """)
+                    
+                    # 提供数据修正建议
+                    st.subheader("数据修正建议")
+                    
+                    if 'Commodity' in df_p_original.columns and 'Hedge_Proxy' in df_ph_original.columns:
+                        paper_commodities = df_p_original['Commodity'].unique()
+                        phys_proxies = df_ph_original['Hedge_Proxy'].unique()
                         
-                        # 显示品种分布
-                        if 'Hedge_Proxy' in df_ph_original.columns:
-                            st.subheader("对冲品种分布")
-                            proxy_summary = df_ph_original.groupby('Hedge_Proxy')['Volume'].sum().reset_index()
-                            proxy_summary = proxy_summary.sort_values('Volume', ascending=False)
-                            
-                            fig = px.bar(proxy_summary, x='Hedge_Proxy', y='Volume',
-                                        title="各品种敞口分布",
-                                        color='Hedge_Proxy')
-                            st.plotly_chart(fig, use_container_width=True)
+                        st.write("纸货品种:", paper_commodities[:10])
+                        st.write("实货对冲品种:", phys_proxies[:10])
+                        
+                        # 检查是否有交集
+                        paper_set = set(str(x).upper().strip() for x in paper_commodities)
+                        phys_set = set(str(x).upper().strip() for x in phys_proxies)
+                        intersection = paper_set.intersection(phys_set)
+                        
+                        if intersection:
+                            st.success(f"找到 {len(intersection)} 个共同品种: {list(intersection)[:5]}")
+                        else:
+                            st.error("没有找到共同的品种！")
             
             # --- 清理临时文件 ---
-            import shutil
             try:
                 shutil.rmtree(temp_dir)
             except:
@@ -326,14 +452,15 @@ if run_btn and ticket_file and phys_file:
                     - 临时文件目录: {temp_dir}
                     - 纸货文件: {paper_path}
                     - 实货文件: {phys_path}
-                    - 输出文件: {output_file}
+                    - 输出文件: {output_file_path if output_file_path else '未找到'}
                     - 执行时间: {calc_time:.2f}秒
-                    - 匹配记录数: {len(df_rels) if not df_rels.empty else 0}
+                    - 匹配记录数: {len(df_rels)}
                     """)
                     
                     if not df_rels.empty:
                         st.markdown("### 匹配结果摘要")
-                        st.write(f"总匹配量: {df_rels['Allocated_Vol'].abs().sum():,.0f} BBL")
+                        if 'Allocated_Vol' in df_rels.columns:
+                            st.write(f"总匹配量: {df_rels['Allocated_Vol'].abs().sum():,.0f} BBL")
                         
                         if 'Open_Price' in df_rels.columns and 'MTM_Price' in df_rels.columns:
                             avg_open = df_rels['Open_Price'].mean()
@@ -480,3 +607,6 @@ st.markdown("""
     <p>© 2024 版权所有 | 仅供内部使用</p>
 </div>
 """, unsafe_allow_html=True)
+
+# 导入必要的模块（在文件末尾避免循环导入）
+import shutil
