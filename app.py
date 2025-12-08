@@ -3,404 +3,133 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 import time
-from datetime import datetime
-from collections import deque
-import warnings
-
-# 忽略警告
-warnings.filterwarnings("ignore")
+import io
 
 # ==============================================================================
-# 1. 核心计算引擎 (直接移植自验证过的 hedge_engine.py)
+# 导入核心引擎 (模块化调用)
 # ==============================================================================
-
-def clean_str(series):
-    """字符串清洗：去空、转大写"""
-    return series.astype(str).str.strip().str.upper().replace('NAN', '')
-
-def standardize_month_vectorized(series):
-    """批量标准化月份格式"""
-    s = series.astype(str).str.strip().str.upper()
-    s = s.replace('NAN', '')
-    s = s.str.replace('-', ' ', regex=False).str.replace('/', ' ', regex=False)
-    dates = pd.to_datetime(s, errors='coerce')
-    return dates.dt.strftime('%b %y').str.upper().fillna(s)
-
-def load_data_engine(paper_file, phys_file):
-    """数据加载引擎 (增强版，带详细日志)"""
-    debug_logs = []
-    try:
-        # --- 读取纸货 ---
-        # 重置指针，防止多次读取导致为空
-        paper_file.seek(0)
-        if paper_file.name.endswith(('.xlsx', '.xls')):
-            df_p = pd.read_excel(paper_file)
-        else:
-            # CSV 编码轮询
-            encodings = ['utf-8', 'gbk', 'gb18030', 'latin1']
-            for enc in encodings:
-                try:
-                    paper_file.seek(0)
-                    df_p = pd.read_csv(paper_file, encoding=enc)
-                    debug_logs.append(f"纸货读取成功 (编码: {enc})")
-                    break
-                except:
-                    continue
-        
-        # --- 读取实货 ---
-        phys_file.seek(0)
-        if phys_file.name.endswith(('.xlsx', '.xls')):
-            df_ph = pd.read_excel(phys_file)
-        else:
-            encodings = ['utf-8', 'gbk', 'gb18030', 'latin1']
-            for enc in encodings:
-                try:
-                    phys_file.seek(0)
-                    df_ph = pd.read_csv(phys_file, encoding=enc)
-                    debug_logs.append(f"实货读取成功 (编码: {enc})")
-                    break
-                except:
-                    continue
-
-    except Exception as e:
-        return pd.DataFrame(), pd.DataFrame(), [f"读取严重错误: {str(e)}"]
-
-    # --- 纸货清洗 ---
-    df_p.columns = df_p.columns.str.strip()
-    # 关键：强制转换日期，无效转NaT
-    df_p['Trade Date'] = pd.to_datetime(df_p['Trade Date'], errors='coerce')
-    df_p['Volume'] = pd.to_numeric(df_p['Volume'], errors='coerce').fillna(0)
-    df_p['Std_Commodity'] = clean_str(df_p['Commodity'])
-    
-    if 'Month' in df_p.columns:
-        df_p['Month'] = standardize_month_vectorized(df_p['Month'])
-    else:
-        df_p['Month'] = ''
-        
-    if 'Recap No' not in df_p.columns:
-        df_p['Recap No'] = df_p.index.astype(str)
-    
-    # 补全财务字段
-    for col in ['Price', 'Mtm Price', 'Total P/L']:
-        if col not in df_p.columns: df_p[col] = 0
-
-    # --- 实货清洗 ---
-    df_ph.columns = df_ph.columns.str.strip()
-    col_map = {
-        'Target_Pricing_Month': 'Target_Contract_Month', 
-        'Target Pricing Month': 'Target_Contract_Month', 
-        'Month': 'Target_Contract_Month'
-    }
-    df_ph.rename(columns=col_map, inplace=True)
-    
-    df_ph['Volume'] = pd.to_numeric(df_ph['Volume'], errors='coerce').fillna(0)
-    df_ph['Unhedged_Volume'] = df_ph['Volume']
-    df_ph['Hedge_Proxy'] = clean_str(df_ph['Hedge_Proxy']) if 'Hedge_Proxy' in df_ph.columns else ''
-    df_ph['Pricing_Benchmark'] = clean_str(df_ph['Pricing_Benchmark'])
-    
-    if 'Target_Contract_Month' in df_ph.columns:
-        df_ph['Target_Contract_Month'] = standardize_month_vectorized(df_ph['Target_Contract_Month'])
-    
-    # 处理指定日 (Designation_Date)
-    # 优先找 Designation_Date，没有则找 Pricing_Start
-    if 'Designation_Date' in df_ph.columns:
-        df_ph['Designation_Date'] = pd.to_datetime(df_ph['Designation_Date'], errors='coerce')
-    elif 'Pricing_Start' in df_ph.columns:
-        df_ph['Designation_Date'] = pd.to_datetime(df_ph['Pricing_Start'], errors='coerce')
-        debug_logs.append("提示: 使用 Pricing_Start 作为 指定日")
-    else:
-        df_ph['Designation_Date'] = pd.NaT
-        debug_logs.append("警告: 未找到指定日列 (Designation_Date 或 Pricing_Start)")
-
-    return df_p, df_ph, debug_logs
-
-def calculate_net_positions(df_paper):
-    """Step 1: 纸货内部 FIFO 净仓计算 (移植自 hedge_engine.py)"""
-    df_paper = df_paper.sort_values(by='Trade Date').reset_index(drop=True)
-    df_paper['Group_Key'] = df_paper['Std_Commodity'] + "_" + df_paper['Month']
-    
-    records = df_paper.to_dict('records')
-    groups = {}
-    for i, row in enumerate(records):
-        key = row['Group_Key']
-        if key not in groups: groups[key] = []
-        groups[key].append(i)
-    
-    for key, indices in groups.items():
-        open_queue = deque()
-        for idx in indices:
-            row = records[idx]
-            current_vol = row.get('Volume', 0)
-            
-            records[idx]['Net_Open_Vol'] = current_vol
-            records[idx]['Closed_Vol'] = 0
-            records[idx]['Close_Events'] = [] 
-            
-            if abs(current_vol) < 0.0001: continue
-            current_sign = 1 if current_vol > 0 else -1
-            
-            while open_queue:
-                q_idx, q_vol, q_sign = open_queue[0]
-                if q_sign != current_sign:
-                    offset = min(abs(current_vol), abs(q_vol))
-                    
-                    close_event = {
-                        'Ref': str(records[idx].get('Recap No', '')),
-                        'Date': records[idx].get('Trade Date'),
-                        'Vol': offset,
-                        'Price': records[idx].get('Price', 0)
-                    }
-                    records[q_idx]['Close_Events'].append(close_event)
-                    
-                    current_vol -= (current_sign * offset)
-                    q_vol -= (q_sign * offset)
-                    
-                    records[q_idx]['Closed_Vol'] += offset
-                    records[q_idx]['Net_Open_Vol'] = q_vol
-                    records[idx]['Closed_Vol'] += offset
-                    records[idx]['Net_Open_Vol'] = current_vol
-                    
-                    if abs(q_vol) < 0.0001: open_queue.popleft()
-                    else: open_queue[0] = (q_idx, q_vol, q_sign)
-                    
-                    if abs(current_vol) < 0.0001: break
-                else:
-                    break
-            
-            if abs(current_vol) > 0.0001:
-                open_queue.append((idx, current_vol, current_sign))
-                
-    return pd.DataFrame(records)
-
-def format_close_details(events):
-    if not events: return "", 0
-    details = []
-    total_vol = 0
-    total_val = 0
-    sorted_events = sorted(events, key=lambda x: x['Date'] if pd.notna(x['Date']) else pd.Timestamp.min)
-    for e in sorted_events:
-        d_str = e['Date'].strftime('%Y-%m-%d') if pd.notna(e['Date']) else 'N/A'
-        p_str = f"@{e['Price']}" if pd.notna(e['Price']) else ""
-        details.append(f"[{d_str} #{e['Ref']} V:{e['Vol']:.0f} {p_str}]")
-        if pd.notna(e['Price']):
-            total_vol += e['Vol']
-            total_val += (e['Vol'] * e['Price'])
-    return " -> ".join(details), total_vol
-
-def auto_match_hedges(physical_df, paper_df):
-    """Step 2: 实货匹配 (v19 开放式逻辑移植)"""
-    hedge_relations = []
-    
-    # 1. 确保回写列存在
-    paper_df['Allocated_To_Phy'] = 0.0
-    
-    # 2. 建立索引 (只取有净敞口的单子)
-    active_paper = paper_df[abs(paper_df['Net_Open_Vol']) > 0.0001].copy()
-    active_paper['Allocated_To_Phy'] = 0.0
-    active_paper['_original_index'] = active_paper.index # 保留原始索引
-
-    # 3. 实货排序 (Time Priority)
-    physical_df['Sort_Date'] = physical_df['Designation_Date'].fillna(pd.Timestamp.max)
-    physical_df_sorted = physical_df.sort_values(by=['Sort_Date', 'Cargo_ID'])
-
-    for idx, cargo in physical_df_sorted.iterrows():
-        cargo_id = cargo['Cargo_ID']
-        phy_vol = cargo['Unhedged_Volume']
-        proxy = str(cargo['Hedge_Proxy'])
-        target_month = cargo.get('Target_Contract_Month', None)
-        phy_dir = cargo.get('Direction', 'Buy')
-        desig_date = cargo.get('Designation_Date', pd.NaT)
-        
-        required_open_sign = -1 if 'BUY' in str(phy_dir).upper() else 1
-        
-        # 筛选: 品种 + 月份 + 方向
-        mask = (
-            (active_paper['Std_Commodity'].str.contains(proxy, regex=False)) & 
-            (active_paper['Month'] == target_month) &
-            (np.sign(active_paper['Net_Open_Vol']) == required_open_sign)
-        )
-        candidates_df = active_paper[mask].copy()
-        
-        if candidates_df.empty: continue
-        
-        # 排序策略 (v19: Abs_Lag 优先)
-        if pd.notna(desig_date) and not candidates_df['Trade Date'].isnull().all():
-            candidates_df['Time_Lag_Days'] = (candidates_df['Trade Date'] - desig_date).dt.days
-            candidates_df['Abs_Lag'] = candidates_df['Time_Lag_Days'].abs()
-            candidates_df = candidates_df.sort_values(by=['Abs_Lag', 'Trade Date'])
-        else:
-            candidates_df['Time_Lag_Days'] = np.nan
-            candidates_df = candidates_df.sort_values(by='Trade Date')
-            
-        candidates = candidates_df.to_dict('records')
-        
-        for ticket in candidates:
-            if abs(phy_vol) < 1: break
-            
-            orig_idx = ticket['_original_index']
-            
-            curr_allocated = active_paper.at[orig_idx, 'Allocated_To_Phy']
-            curr_net_open = active_paper.at[orig_idx, 'Net_Open_Vol']
-            net_avail = curr_net_open - curr_allocated
-            
-            if abs(net_avail) < 0.0001: continue
-            
-            if abs(net_avail) >= abs(phy_vol):
-                alloc_amt = (1 if net_avail > 0 else -1) * abs(phy_vol)
-            else:
-                alloc_amt = net_avail
-                
-            phy_vol -= (-alloc_amt)
-            active_paper.at[orig_idx, 'Allocated_To_Phy'] += alloc_amt
-            
-            # 财务数据
-            open_price = ticket.get('Price', 0)
-            mtm_price = ticket.get('Mtm Price', 0)
-            total_pl = ticket.get('Total P/L', 0)
-            close_path, _ = format_close_details(ticket.get('Close_Events', []))
-            
-            unrealized_mtm = (mtm_price - open_price) * alloc_amt
-            ratio = 0
-            if abs(ticket.get('Volume', 0)) > 0:
-                ratio = abs(alloc_amt) / abs(ticket['Volume'])
-            alloc_total_pl = total_pl * ratio
-            
-            hedge_relations.append({
-                'Cargo_ID': cargo_id,
-                'Ticket_ID': ticket.get('Recap No'),
-                'Month': ticket.get('Month'),
-                'Trade_Date': ticket.get('Trade Date'),
-                'Allocated_Vol': alloc_amt,
-                'Open_Price': open_price,
-                'MTM_PL': round(unrealized_mtm, 2),
-                'Total_PL_Alloc': round(alloc_total_pl, 2),
-                'Time_Lag': ticket.get('Time_Lag_Days'),
-                'Close_Path': close_path
-            })
-            
-        physical_df_sorted.at[idx, 'Unhedged_Volume'] = phy_vol
-        
-    # 回写分配状态 (Safe Map)
-    if not active_paper.empty:
-        alloc_map = active_paper.set_index('_original_index')['Allocated_To_Phy']
-        paper_df['Allocated_To_Phy'] = paper_df.index.map(alloc_map).fillna(0.0)
-    else:
-        paper_df['Allocated_To_Phy'] = 0.0
-        
-    return pd.DataFrame(hedge_relations), physical_df_sorted, paper_df
+try:
+    import hedge_engine as engine
+except ImportError:
+    st.error("❌ 严重错误: 找不到 hedge_engine.py 模块！请确保该文件在同一目录下。")
+    st.stop()
 
 # ==============================================================================
-# 2. Streamlit UI
+# Streamlit UI
 # ==============================================================================
 
 st.set_page_config(page_title="Hedge Master Analytics", page_icon="📈", layout="wide")
 
-# CSS
+# CSS 样式
 st.markdown("""
 <style>
     .stDataFrame { border: 1px solid #ddd; border-radius: 5px; }
+    .metric-card { background-color: #f8f9fa; padding: 15px; border-radius: 8px; margin-bottom: 10px; }
 </style>
 """, unsafe_allow_html=True)
 
 col_title = st.columns([1])[0]
 with col_title:
     st.title("Hedge Master Analytics 📊")
-    st.markdown("**基于 v22 引擎 (移植版) 的智能套保有效性分析系统**")
+    st.markdown("**基于 v22 引擎 (模块化版) 的智能套保有效性分析系统**")
 
 st.divider()
 
+# --- 侧边栏 ---
 with st.sidebar:
     st.header("📂 数据接入")
     ticket_file = st.file_uploader("上传纸货水单 (Ticket Data)", type=['xlsx', 'csv'])
     phys_file = st.file_uploader("上传实货台账 (Physical Ledger)", type=['xlsx', 'csv'])
+    
+    st.markdown("---")
     run_btn = st.button("🚀 开始全景分析", type="primary", use_container_width=True)
-    st.caption("Engine: Ported from Working Script")
+    st.caption("Engine: hedge_engine.py v22")
 
+# --- 主逻辑 ---
 if run_btn:
     if ticket_file and phys_file:
-        with st.spinner('正在执行匹配运算...'):
-            # 1. 加载
-            df_p, df_ph, logs = load_data_engine(ticket_file, phys_file)
-            
-            # --- 🕵️‍♂️ 数据侦探 (调试面板) ---
-            with st.expander("🕵️‍♂️ 数据侦探 (查看数据加载情况)"):
-                st.write("日志:", logs)
-                c1, c2 = st.columns(2)
-                with c1:
-                    st.write(f"实货记录数: {len(df_ph)}")
-                    if not df_ph.empty:
-                        st.write("实货月份示例:", df_ph['Target_Contract_Month'].unique()[:5])
-                        st.write("实货指定日示例:", df_ph['Designation_Date'].dt.date.unique()[:5])
-                with c2:
-                    st.write(f"纸货记录数: {len(df_p)}")
-                    if not df_p.empty:
-                        st.write("纸货月份示例:", df_p['Month'].unique()[:5])
-                        
-            if not df_ph.empty and not df_p.empty:
-                # 2. 核心计算
-                start_t = time.time()
-                df_p_net = calculate_net_positions(df_p)
-                df_rels, df_ph_final, df_p_final = auto_match_hedges(df_ph, df_p_net)
-                calc_time = time.time() - start_t
+        with st.spinner('正在调用 hedge_engine 执行计算...'):
+            try:
+                # 1. 加载 (直接传 Streamlit 的 UploadedFile 对象给引擎的 read_file_fast)
+                # 注意：read_file_fast 需要支持 seek(0)
+                # 引擎里的 load_data_v19 调用了 read_file_fast
+                df_p, df_ph = engine.load_data_v19(ticket_file, phys_file)
                 
-                st.success(f"分析完成！耗时 {calc_time:.2f} 秒，生成 {len(df_rels)} 条匹配记录")
-                
-                # --- KPI ---
-                total_exp = df_ph_final['Volume'].abs().sum()
-                unhedged = df_ph_final['Unhedged_Volume'].abs().sum()
-                hedged_vol = total_exp - unhedged
-                coverage = (hedged_vol / total_exp * 100) if total_exp > 0 else 0
-                total_mtm = df_rels['MTM_PL'].sum() if not df_rels.empty else 0
-                
-                kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-                kpi1.metric("实货总敞口", f"{total_exp:,.0f} BBL")
-                kpi2.metric("套保覆盖率", f"{coverage:.1f}%")
-                kpi3.metric("风险裸露敞口", f"{unhedged:,.0f} BBL")
-                kpi4.metric("套保组合 MTM", f"${total_mtm:,.0f}")
-                
-                st.markdown("---")
-
-                # --- Charts ---
-                c1, c2 = st.columns([2, 1])
-                with c1:
-                    st.subheader("📅 月度覆盖")
-                    if 'Target_Contract_Month' in df_ph_final.columns:
-                        chart_data = df_ph_final.groupby('Target_Contract_Month')[['Volume', 'Unhedged_Volume']].sum().abs().reset_index()
-                        chart_data['Hedged'] = chart_data['Volume'] - chart_data['Unhedged_Volume']
-                        fig = px.bar(chart_data, x='Target_Contract_Month', y=['Hedged', 'Unhedged_Volume'], 
-                                     title="Monthly Exposure vs Hedge", template="plotly_white",
-                                     color_discrete_map={'Hedged': '#00CC96', 'Unhedged_Volume': '#EF553B'})
-                        st.plotly_chart(fig, use_container_width=True)
-                
-                with c2:
-                    st.subheader("🍰 占比")
-                    fig_pie = px.pie(values=[hedged_vol, unhedged], names=['Hedged', 'Unhedged'], 
-                                     color_discrete_sequence=['#00CC96', '#EF553B'])
-                    st.plotly_chart(fig_pie, use_container_width=True)
-
-                # --- Tables ---
-                st.subheader("📋 数据账本")
-                tab1, tab2, tab3 = st.tabs(["✅ 匹配明细", "⚠️ 实货剩余", "📦 纸货剩余"])
-                
-                with tab1:
-                    if not df_rels.empty:
-                        st.dataframe(df_rels, use_container_width=True)
-                        csv = df_rels.to_csv(index=False).encode('utf-8')
-                        st.download_button("📥 下载明细", csv, "hedge_allocation.csv", "text/csv")
-                    else:
-                        st.info("无匹配记录")
-                        
-                with tab2:
-                    st.dataframe(df_ph_final[abs(df_ph_final['Unhedged_Volume']) > 1], use_container_width=True)
+                if not df_ph.empty and not df_p.empty:
+                    # 2. 核心计算
+                    start_t = time.time()
                     
-                with tab3:
-                    if 'Allocated_To_Phy' in df_p_final.columns:
-                        df_p_final['Implied_Remaining'] = df_p_final['Volume'] - df_p_final['Allocated_To_Phy']
-                        unused = df_p_final[abs(df_p_final['Implied_Remaining']) > 1]
-                        cols_show = ['Recap No', 'Std_Commodity', 'Month', 'Volume', 'Allocated_To_Phy', 'Implied_Remaining', 'Price']
-                        final_cols = [c for c in cols_show if c in unused.columns]
-                        st.dataframe(unused[final_cols], use_container_width=True)
-            else:
-                st.error("数据加载后为空")
+                    # Step 1: 净仓
+                    df_p_net = engine.calculate_net_positions_corrected(df_p)
+                    
+                    # Step 2: 匹配
+                    df_rels, df_ph_final, df_p_final = engine.auto_match_hedges(df_ph, df_p_net)
+                    
+                    calc_time = time.time() - start_t
+                    st.success(f"分析完成！耗时 {calc_time:.2f} 秒")
+                    
+                    # --- KPI ---
+                    total_exp = df_ph_final['Volume'].abs().sum()
+                    unhedged = df_ph_final['Unhedged_Volume'].abs().sum()
+                    hedged_vol = total_exp - unhedged
+                    coverage = (hedged_vol / total_exp * 100) if total_exp > 0 else 0
+                    total_mtm = df_rels['MTM_PL'].sum() if not df_rels.empty else 0
+                    
+                    kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+                    kpi1.metric("实货总敞口", f"{total_exp:,.0f} BBL")
+                    kpi2.metric("套保覆盖率", f"{coverage:.1f}%")
+                    kpi3.metric("风险裸露敞口", f"{unhedged:,.0f} BBL")
+                    kpi4.metric("套保组合 MTM", f"${total_mtm:,.0f}")
+                    
+                    st.markdown("---")
+
+                    # --- Charts ---
+                    c1, c2 = st.columns([2, 1])
+                    with c1:
+                        st.subheader("📅 月度覆盖")
+                        if 'Target_Contract_Month' in df_ph_final.columns:
+                            chart_data = df_ph_final.groupby('Target_Contract_Month')[['Volume', 'Unhedged_Volume']].sum().abs().reset_index()
+                            chart_data['Hedged'] = chart_data['Volume'] - chart_data['Unhedged_Volume']
+                            fig = px.bar(chart_data, x='Target_Contract_Month', y=['Hedged', 'Unhedged_Volume'], 
+                                         title="Monthly Exposure vs Hedge", template="plotly_white",
+                                         color_discrete_map={'Hedged': '#00CC96', 'Unhedged_Volume': '#EF553B'})
+                            st.plotly_chart(fig, use_container_width=True)
+                    
+                    with c2:
+                        st.subheader("🍰 占比")
+                        fig_pie = px.pie(values=[hedged_vol, unhedged], names=['Hedged', 'Unhedged'], 
+                                         color_discrete_sequence=['#00CC96', '#EF553B'])
+                        st.plotly_chart(fig_pie, use_container_width=True)
+
+                    # --- Tables ---
+                    st.subheader("📋 数据账本")
+                    tab1, tab2, tab3 = st.tabs(["✅ 匹配明细", "⚠️ 实货剩余", "📦 纸货剩余"])
+                    
+                    with tab1:
+                        if not df_rels.empty:
+                            st.dataframe(df_rels, use_container_width=True)
+                            csv = df_rels.to_csv(index=False).encode('utf-8')
+                            st.download_button("📥 下载明细 CSV", csv, "hedge_allocation.csv", "text/csv")
+                        else:
+                            st.info("无匹配记录")
+                            
+                    with tab2:
+                        st.dataframe(df_ph_final[abs(df_ph_final['Unhedged_Volume']) > 1], use_container_width=True)
+                        
+                    with tab3:
+                        if 'Allocated_To_Phy' in df_p_final.columns:
+                            df_p_final['Implied_Remaining'] = df_p_final['Volume'] - df_p_final['Allocated_To_Phy']
+                            unused = df_p_final[abs(df_p_final['Implied_Remaining']) > 1]
+                            cols_show = ['Recap No', 'Std_Commodity', 'Month', 'Volume', 'Allocated_To_Phy', 'Implied_Remaining', 'Price']
+                            final_cols = [c for c in cols_show if c in unused.columns]
+                            st.dataframe(unused[final_cols], use_container_width=True)
+                        else:
+                            st.error("无法计算剩余纸货 (列丢失)")
+                else:
+                    st.error("数据加载后为空")
+            except Exception as e:
+                st.error(f"运行时错误: {str(e)}")
+                import traceback
+                st.code(traceback.format_exc())
     else:
         st.warning("请上传文件")
