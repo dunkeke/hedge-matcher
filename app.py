@@ -160,10 +160,14 @@ def run_engine_with_streamlit(paper_file_obj, paper_file_name, phys_file_obj, ph
         # Step 1: 净仓
         df_p_net = engine_raw.calculate_net_positions_corrected(df_p)
         
-        # Step 2: 匹配
+        # Step 2: 匹配 - 注意：原始函数只返回2个值
         df_rels, df_ph_updated = engine_raw.auto_match_hedges(df_ph, df_p_net)
         
         # 我们需要创建一个增强的纸货DataFrame，显示分配情况
+        # 首先确保 df_p_net 有 Allocated_To_Phy 列
+        if 'Allocated_To_Phy' not in df_p_net.columns:
+            df_p_net['Allocated_To_Phy'] = 0
+        
         if not df_rels.empty and 'Ticket_ID' in df_rels.columns:
             # 按纸货交易分组汇总分配量
             alloc_summary = df_rels.groupby('Ticket_ID')['Allocated_Vol'].sum().reset_index()
@@ -184,14 +188,21 @@ def run_engine_with_streamlit(paper_file_obj, paper_file_name, phys_file_obj, ph
                 right_on='Ticket_ID', 
                 how='left'
             )
-            df_p_final['Allocated_To_Phy'] = df_p_final['Allocated_To_Phy'].fillna(0)
+            
+            # 更新分配量：如果有匹配记录则使用，否则保持0
+            mask = df_p_final['Allocated_To_Phy_y'].notna()
+            df_p_final.loc[mask, 'Allocated_To_Phy_x'] = df_p_final.loc[mask, 'Allocated_To_Phy_y']
+            df_p_final.rename(columns={'Allocated_To_Phy_x': 'Allocated_To_Phy'}, inplace=True)
             
             # 清理临时列
-            if 'Ticket_ID' in df_p_final.columns:
-                df_p_final = df_p_final.drop(columns=['Ticket_ID'])
+            drop_cols = ['Allocated_To_Phy_y', 'Ticket_ID']
+            df_p_final = df_p_final.drop(columns=[col for col in drop_cols if col in df_p_final.columns])
+            
+            df_p_final['Allocated_To_Phy'] = df_p_final['Allocated_To_Phy'].fillna(0)
         else:
             df_p_final = df_p_net.copy()
-            df_p_final['Allocated_To_Phy'] = 0
+            if 'Allocated_To_Phy' not in df_p_final.columns:
+                df_p_final['Allocated_To_Phy'] = 0
         
         return df_rels, df_ph_updated, df_p_final
     else:
@@ -324,12 +335,10 @@ if run_btn and ticket_file and phys_file:
             # 步骤1: 数据加载
             status_text.text("步骤 1/3: 加载数据...")
             progress_bar.progress(20)
-            time.sleep(0.5)
             
             # 步骤2: 运行引擎
             status_text.text("步骤 2/3: 执行套保匹配引擎...")
             progress_bar.progress(50)
-            time.sleep(0.5)
             
             start_t = time.time()
             
@@ -346,29 +355,39 @@ if run_btn and ticket_file and phys_file:
             # 步骤3: 计算结果
             status_text.text("步骤 3/3: 生成分析报告...")
             progress_bar.progress(90)
-            time.sleep(0.5)
             
             progress_bar.progress(100)
             status_text.text("✅ 分析完成！")
             
             st.markdown(f'<div class="success-message">分析完成！耗时 {calc_time:.2f} 秒</div>', unsafe_allow_html=True)
             
-            # --- KPI 指标 ---
-            st.markdown("## 📊 关键指标概览")
+            # 显示匹配结果摘要
+            st.markdown("## 📊 分析结果摘要")
+            
+            # 检查数据是否有效
+            if df_ph_final is None or df_ph_final.empty:
+                st.error("实货数据处理失败")
+                st.stop()
+            
+            if df_rels is None:
+                df_rels = pd.DataFrame()
             
             # 计算指标
-            if not df_ph_final.empty and 'Volume' in df_ph_final.columns:
+            if 'Volume' in df_ph_final.columns and 'Unhedged_Volume' in df_ph_final.columns:
                 total_exp = df_ph_final['Volume'].abs().sum()
                 unhedged = df_ph_final['Unhedged_Volume'].abs().sum()
                 hedged_vol = total_exp - unhedged
                 coverage = (hedged_vol / total_exp * 100) if total_exp > 0 else 0
                 
                 # 计算MTM和PL
-                if not df_rels.empty:
-                    total_mtm = df_rels['Alloc_Unrealized_MTM'].sum() if 'Alloc_Unrealized_MTM' in df_rels.columns else 0
-                    total_pl = df_rels['Alloc_Total_PL'].sum() if 'Alloc_Total_PL' in df_rels.columns else 0
+                if not df_rels.empty and 'Alloc_Unrealized_MTM' in df_rels.columns:
+                    total_mtm = df_rels['Alloc_Unrealized_MTM'].sum()
                 else:
                     total_mtm = 0
+                
+                if not df_rels.empty and 'Alloc_Total_PL' in df_rels.columns:
+                    total_pl = df_rels['Alloc_Total_PL'].sum()
+                else:
                     total_pl = 0
                 
                 # 匹配交易数量
@@ -415,36 +434,104 @@ if run_btn and ticket_file and phys_file:
                 
                 st.markdown("---")
                 
-                # --- 图表区域 ---
+                # --- 数据表格区域 ---
+                st.markdown("## 📋 详细数据")
+                
+                tab1, tab2, tab3 = st.tabs(["✅ 匹配明细", "⚠️ 实货剩余", "📦 纸货剩余"])
+                
+                with tab1:
+                    if not df_rels.empty:
+                        # 显示匹配明细
+                        st.dataframe(df_rels, use_container_width=True)
+                        
+                        # 下载按钮
+                        csv = df_rels.to_csv(index=False).encode('utf-8')
+                        st.download_button(
+                            "📥 下载匹配明细 CSV",
+                            data=csv,
+                            file_name="hedge_allocation_details.csv",
+                            mime="text/csv",
+                            use_container_width=True
+                        )
+                    else:
+                        st.markdown('<div class="warning-message">无匹配记录</div>', unsafe_allow_html=True)
+                
+                with tab2:
+                    if not df_ph_final.empty:
+                        # 显示实货数据
+                        display_cols = [col for col in ['Cargo_ID', 'Volume', 'Unhedged_Volume', 
+                                                       'Hedge_Proxy', 'Target_Contract_Month', 
+                                                       'Designation_Date'] 
+                                      if col in df_ph_final.columns]
+                        
+                        if display_cols:
+                            # 只显示还有未对冲敞口的实货
+                            remaining_phy = df_ph_final[abs(df_ph_final['Unhedged_Volume']) > 0.1].copy()
+                            
+                            if not remaining_phy.empty:
+                                st.info(f"还有 {len(remaining_phy)} 笔实货存在未对冲敞口")
+                                st.dataframe(remaining_phy[display_cols], use_container_width=True)
+                            else:
+                                st.success("🎉 所有实货敞口均已完全对冲！")
+                                st.dataframe(df_ph_final[display_cols], use_container_width=True)
+                        else:
+                            st.dataframe(df_ph_final, use_container_width=True)
+                    else:
+                        st.warning("实货数据为空")
+                
+                with tab3:
+                    if not df_p_final.empty:
+                        # 计算剩余量
+                        if 'Volume' in df_p_final.columns and 'Allocated_To_Phy' in df_p_final.columns:
+                            df_p_final['Implied_Remaining'] = df_p_final['Volume'] - df_p_final['Allocated_To_Phy']
+                            
+                            # 选择显示列
+                            paper_display_cols = []
+                            for col in ['Recap No', 'Std_Commodity', 'Month', 'Trade Date', 
+                                       'Volume', 'Allocated_To_Phy', 'Implied_Remaining', 'Price']:
+                                if col in df_p_final.columns:
+                                    paper_display_cols.append(col)
+                            
+                            if paper_display_cols:
+                                # 只显示还有剩余量的纸货
+                                remaining_paper = df_p_final[abs(df_p_final['Implied_Remaining']) > 0.1].copy()
+                                
+                                if not remaining_paper.empty:
+                                    st.info(f"还有 {len(remaining_paper)} 笔纸货交易未完全分配")
+                                    st.dataframe(remaining_paper[paper_display_cols], use_container_width=True)
+                                else:
+                                    st.success("📊 所有纸货交易均已完全分配！")
+                                    st.dataframe(df_p_final[paper_display_cols], use_container_width=True)
+                            else:
+                                st.dataframe(df_p_final, use_container_width=True)
+                        else:
+                            st.dataframe(df_p_final, use_container_width=True)
+                    else:
+                        st.warning("纸货数据为空")
+                
+                # --- 可视化分析 ---
+                st.markdown("---")
                 st.markdown("## 📈 可视化分析")
                 
                 if 'Target_Contract_Month' in df_ph_final.columns:
-                    col_chart1, col_chart2 = st.columns([2, 1])
+                    # 准备图表数据
+                    chart_data = df_ph_final.copy()
+                    chart_data['Hedged'] = chart_data['Volume'].abs() - chart_data['Unhedged_Volume'].abs()
+                    chart_data['Unhedged'] = chart_data['Unhedged_Volume'].abs()
                     
-                    with col_chart1:
-                        st.subheader("📅 月度敞口覆盖情况")
-                        # 准备图表数据
-                        chart_data = df_ph_final.copy()
-                        chart_data['Hedged'] = chart_data['Volume'].abs() - chart_data['Unhedged_Volume'].abs()
-                        chart_data['Unhedged'] = chart_data['Unhedged_Volume'].abs()
+                    # 按月份分组
+                    monthly_summary = chart_data.groupby('Target_Contract_Month').agg({
+                        'Hedged': 'sum',
+                        'Unhedged': 'sum',
+                        'Volume': 'sum'
+                    }).reset_index()
+                    
+                    if not monthly_summary.empty:
+                        col_chart1, col_chart2 = st.columns([2, 1])
                         
-                        # 按月份分组
-                        monthly_summary = chart_data.groupby('Target_Contract_Month').agg({
-                            'Hedged': 'sum',
-                            'Unhedged': 'sum',
-                            'Volume': 'sum'
-                        }).reset_index()
-                        
-                        # 排序月份（如果可能）
-                        try:
-                            # 尝试转换为日期排序
-                            monthly_summary['Month_Sort'] = pd.to_datetime(monthly_summary['Target_Contract_Month'], format='%b %y', errors='coerce')
-                            monthly_summary = monthly_summary.sort_values('Month_Sort')
-                        except:
-                            # 如果不能转换，按字母排序
-                            monthly_summary = monthly_summary.sort_values('Target_Contract_Month')
-                        
-                        if not monthly_summary.empty:
+                        with col_chart1:
+                            st.subheader("📅 月度敞口覆盖情况")
+                            
                             fig_bar = px.bar(
                                 monthly_summary, 
                                 x='Target_Contract_Month', 
@@ -473,86 +560,36 @@ if run_btn and ticket_file and phys_file:
                                 )
                             )
                             st.plotly_chart(fig_bar, use_container_width=True)
-                    
-                    with col_chart2:
-                        st.subheader("📊 套保占比分析")
                         
-                        # 饼图数据
-                        labels = ['已套保', '未套保']
-                        values = [hedged_vol, unhedged]
-                        
-                        if total_exp > 0:
-                            fig_pie = px.pie(
-                                values=values, 
-                                names=labels,
-                                color_discrete_sequence=['#2E86AB', '#A23B72'],
-                                hole=0.4,
-                                title=f"套保覆盖率: {coverage:.1f}%"
-                            )
-                            fig_pie.update_traces(
-                                textposition='inside', 
-                                textinfo='percent+label',
-                                hovertemplate='<b>%{label}</b><br>' +
-                                            '数量: %{value:,.0f} BBL<br>' +
-                                            '占比: %{percent}'
-                            )
-                            st.plotly_chart(fig_pie, use_container_width=True)
-                        else:
-                            st.info("无敞口数据")
+                        with col_chart2:
+                            st.subheader("📊 套保占比分析")
+                            
+                            # 饼图数据
+                            labels = ['已套保', '未套保']
+                            values = [hedged_vol, unhedged]
+                            
+                            if total_exp > 0:
+                                fig_pie = px.pie(
+                                    values=values, 
+                                    names=labels,
+                                    color_discrete_sequence=['#2E86AB', '#A23B72'],
+                                    hole=0.4,
+                                    title=f"套保覆盖率: {coverage:.1f}%"
+                                )
+                                fig_pie.update_traces(
+                                    textposition='inside', 
+                                    textinfo='percent+label',
+                                    hovertemplate='<b>%{label}</b><br>' +
+                                                '数量: %{value:,.0f} BBL<br>' +
+                                                '占比: %{percent}'
+                                )
+                                st.plotly_chart(fig_pie, use_container_width=True)
+                            else:
+                                st.info("无敞口数据")
+                    else:
+                        st.info("无月度汇总数据可展示")
                 else:
-                    st.warning("实货数据中缺少 Target_Contract_Month 列，无法生成月度图表")
-                
-                # --- 数据表格区域 ---
-                st.markdown("---")
-                st.markdown("## 📋 详细数据")
-                
-                tab1, tab2, tab3 = st.tabs(["✅ 匹配明细", "⚠️ 实货剩余", "📦 纸货剩余"])
-                
-                with tab1:
-                    if not df_rels.empty:
-                        # 显示匹配明细
-                        st.dataframe(df_rels, use_container_width=True)
-                        
-                        # 下载按钮
-                        csv = df_rels.to_csv(index=False).encode('utf-8')
-                        st.download_button(
-                            "📥 下载匹配明细 CSV",
-                            data=csv,
-                            file_name="hedge_allocation_details.csv",
-                            mime="text/csv",
-                            use_container_width=True
-                        )
-                    else:
-                        st.markdown('<div class="warning-message">无匹配记录</div>', unsafe_allow_html=True)
-                
-                with tab2:
-                    if not df_ph_final.empty:
-                        # 只显示还有未对冲敞口的实货
-                        remaining_phy = df_ph_final[abs(df_ph_final['Unhedged_Volume']) > 0.1].copy()
-                        
-                        if not remaining_phy.empty:
-                            st.info(f"还有 {len(remaining_phy)} 笔实货存在未对冲敞口")
-                            st.dataframe(remaining_phy, use_container_width=True)
-                        else:
-                            st.success("🎉 所有实货敞口均已完全对冲！")
-                    else:
-                        st.warning("实货数据为空")
-                
-                with tab3:
-                    if not df_p_final.empty and 'Allocated_To_Phy' in df_p_final.columns:
-                        # 计算剩余量
-                        df_p_final['Implied_Remaining'] = df_p_final['Volume'] - df_p_final['Allocated_To_Phy']
-                        
-                        # 只显示还有剩余量的纸货
-                        remaining_paper = df_p_final[abs(df_p_final['Implied_Remaining']) > 0.1].copy()
-                        
-                        if not remaining_paper.empty:
-                            st.info(f"还有 {len(remaining_paper)} 笔纸货交易未完全分配")
-                            st.dataframe(remaining_paper, use_container_width=True)
-                        else:
-                            st.success("📊 所有纸货交易均已完全分配！")
-                    else:
-                        st.warning("纸货数据为空或缺少分配信息")
+                    st.info("实货数据中缺少 Target_Contract_Month 列，无法生成月度图表")
                 
                 # --- 总结报告 ---
                 st.markdown("---")
@@ -623,7 +660,8 @@ MTM估值: ${total_mtm:,.0f}
                     )
                 
             else:
-                st.error("实货数据加载后为空或缺少必要列")
+                st.error("实货数据缺少必要列 (Volume 或 Unhedged_Volume)")
+                st.dataframe(df_ph_final.head())
                 
         except Exception as e:
             st.error(f"❌ 运行时错误: {str(e)}")
