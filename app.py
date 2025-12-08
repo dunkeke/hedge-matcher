@@ -11,14 +11,15 @@ import warnings
 warnings.filterwarnings("ignore")
 
 # ==============================================================================
-# 1. 核心计算引擎 (v20 Core Engine - Robust Version)
+# 1. 核心计算引擎 (v21 Core Engine - Robust & Safe)
 # ==============================================================================
 
 def clean_str(series):
+    """字符串清洗：去空、转大写"""
     return series.astype(str).str.strip().str.upper().replace('NAN', '')
 
 def standardize_month_vectorized(series):
-    """批量标准化月份格式"""
+    """批量标准化月份格式 (DEC 25)"""
     s = series.astype(str).str.strip().str.upper()
     s = s.replace('NAN', '')
     s = s.str.replace('-', ' ', regex=False).str.replace('/', ' ', regex=False)
@@ -26,19 +27,27 @@ def standardize_month_vectorized(series):
     return dates.dt.strftime('%b %y').str.upper().fillna(s)
 
 def load_data_engine(paper_file, phys_file):
-    """数据加载引擎"""
+    """数据加载引擎 (带重试机制)"""
     try:
+        # 读取纸货
         if paper_file.name.endswith(('.xlsx', '.xls')):
             df_p = pd.read_excel(paper_file)
         else:
-            try: df_p = pd.read_csv(paper_file)
-            except: df_p = pd.read_csv(paper_file, encoding='gbk')
+            try:
+                df_p = pd.read_csv(paper_file)
+            except:
+                paper_file.seek(0) # 关键：重置指针
+                df_p = pd.read_csv(paper_file, encoding='gbk')
 
+        # 读取实货
         if phys_file.name.endswith(('.xlsx', '.xls')):
             df_ph = pd.read_excel(phys_file)
         else:
-            try: df_ph = pd.read_csv(phys_file)
-            except: df_ph = pd.read_csv(phys_file, encoding='gbk')
+            try:
+                df_ph = pd.read_csv(phys_file)
+            except:
+                phys_file.seek(0) # 关键：重置指针
+                df_ph = pd.read_csv(phys_file, encoding='gbk')
     except Exception as e:
         st.error(f"文件读取失败: {e}")
         return pd.DataFrame(), pd.DataFrame()
@@ -48,7 +57,7 @@ def load_data_engine(paper_file, phys_file):
     df_ph.columns = df_ph.columns.str.strip()
 
     # --- 纸货清洗 ---
-    df_p['Trade Date'] = pd.to_datetime(df_p['Trade Date'])
+    df_p['Trade Date'] = pd.to_datetime(df_p['Trade Date'], errors='coerce')
     df_p['Volume'] = pd.to_numeric(df_p['Volume'], errors='coerce').fillna(0)
     df_p['Std_Commodity'] = clean_str(df_p['Commodity'])
     
@@ -60,6 +69,7 @@ def load_data_engine(paper_file, phys_file):
     if 'Recap No' not in df_p.columns:
         df_p['Recap No'] = df_p.index.astype(str)
     
+    # 补全财务字段
     for col in ['Price', 'Mtm Price', 'Total P/L']:
         if col not in df_p.columns: df_p[col] = 0
 
@@ -79,6 +89,7 @@ def load_data_engine(paper_file, phys_file):
     if 'Target_Contract_Month' in df_ph.columns:
         df_ph['Target_Contract_Month'] = standardize_month_vectorized(df_ph['Target_Contract_Month'])
     
+    # 处理指定日
     if 'Designation_Date' in df_ph.columns:
         df_ph['Designation_Date'] = pd.to_datetime(df_ph['Designation_Date'], errors='coerce')
     elif 'Pricing_Start' in df_ph.columns:
@@ -90,6 +101,7 @@ def load_data_engine(paper_file, phys_file):
 
 def calculate_net_positions(df_paper):
     """Step 1: 纸货内部 FIFO 净仓计算"""
+    # 确保按时间排序
     df_paper = df_paper.sort_values(by='Trade Date').reset_index(drop=True)
     df_paper['Group_Key'] = df_paper['Std_Commodity'] + "_" + df_paper['Month']
     
@@ -106,6 +118,7 @@ def calculate_net_positions(df_paper):
             row = records[idx]
             current_vol = row.get('Volume', 0)
             
+            # 初始化关键字段
             records[idx]['Net_Open_Vol'] = current_vol
             records[idx]['Closed_Vol'] = 0
             records[idx]['Close_Events'] = [] 
@@ -118,6 +131,7 @@ def calculate_net_positions(df_paper):
                 if q_sign != current_sign:
                     offset = min(abs(current_vol), abs(q_vol))
                     
+                    # 记录平仓事件
                     close_event = {
                         'Ref': str(records[idx].get('Recap No', '')),
                         'Date': records[idx].get('Trade Date'),
@@ -126,6 +140,7 @@ def calculate_net_positions(df_paper):
                     }
                     records[q_idx]['Close_Events'].append(close_event)
                     
+                    # 净额抵消 (减法)
                     current_vol -= (current_sign * offset)
                     q_vol -= (q_sign * offset)
                     
@@ -165,14 +180,15 @@ def auto_match_hedges(physical_df, paper_df):
     """Step 2: 实货匹配 (Safe Update Version)"""
     hedge_relations = []
     
-    # 建立索引：使用原始索引
-    # 确保 Allocated_To_Phy 在 paper_df 中初始化
+    # 强制初始化，防止 KeyError
     paper_df['Allocated_To_Phy'] = 0.0
     
+    # 索引构建 (只取有净敞口的单子)
     active_paper = paper_df[abs(paper_df['Net_Open_Vol']) > 0.0001].copy()
+    active_paper['Allocated_To_Phy'] = 0.0
     active_paper['_original_index'] = active_paper.index
 
-    # 实货排序
+    # 实货排序 (抢单公平性)
     physical_df['Sort_Date'] = physical_df['Designation_Date'].fillna(pd.Timestamp.max)
     physical_df_sorted = physical_df.sort_values(by=['Sort_Date', 'Cargo_ID'])
 
@@ -186,6 +202,7 @@ def auto_match_hedges(physical_df, paper_df):
         
         required_open_sign = -1 if 'BUY' in str(phy_dir).upper() else 1
         
+        # 筛选：品种 + 月份 + 方向
         mask = (
             (active_paper['Std_Commodity'].str.contains(proxy, regex=False)) & 
             (active_paper['Month'] == target_month) &
@@ -195,7 +212,7 @@ def auto_match_hedges(physical_df, paper_df):
         
         if candidates_df.empty: continue
         
-        # 排序
+        # 排序策略 (v19 开放式匹配: Abs_Lag 最小优先)
         if pd.notna(desig_date) and not candidates_df['Trade Date'].isnull().all():
             candidates_df['Time_Lag_Days'] = (candidates_df['Trade Date'] - desig_date).dt.days
             candidates_df['Abs_Lag'] = candidates_df['Time_Lag_Days'].abs()
@@ -210,12 +227,15 @@ def auto_match_hedges(physical_df, paper_df):
             if abs(phy_vol) < 1: break
             
             orig_idx = ticket['_original_index']
+            
+            # 实时查余额
             curr_allocated = active_paper.at[orig_idx, 'Allocated_To_Phy']
             curr_net_open = active_paper.at[orig_idx, 'Net_Open_Vol']
             net_avail = curr_net_open - curr_allocated
             
             if abs(net_avail) < 0.0001: continue
             
+            # 分配量
             if abs(net_avail) >= abs(phy_vol):
                 alloc_amt = (1 if net_avail > 0 else -1) * abs(phy_vol)
             else:
@@ -224,6 +244,7 @@ def auto_match_hedges(physical_df, paper_df):
             phy_vol -= (-alloc_amt)
             active_paper.at[orig_idx, 'Allocated_To_Phy'] += alloc_amt
             
+            # 财务数据
             open_price = ticket.get('Price', 0)
             mtm_price = ticket.get('Mtm Price', 0)
             total_pl = ticket.get('Total P/L', 0)
@@ -251,22 +272,13 @@ def auto_match_hedges(physical_df, paper_df):
             
         physical_df_sorted.at[idx, 'Unhedged_Volume'] = phy_vol
         
-    # --- 修复回写逻辑 (Use Map instead of Update) ---
-    # 这比 update 更稳健，确保 Allocated_To_Phy 被强制覆盖
+    # --- 安全回写分配量 ---
     if not active_paper.empty:
-        # 创建一个从 index 到 Allocated_To_Phy 的映射
-        alloc_map = active_paper.set_index('_original_index')['Allocated_To_Phy']
-        # 映射回原始 df，未匹配到的填充 0
-        paper_df['Allocated_To_Phy'] = paper_df.index.map(alloc_map).fillna(0.0)
+        # 使用 map 进行回写，比 update 更稳健
+        alloc_series = active_paper.set_index('_original_index')['Allocated_To_Phy']
+        paper_df['Allocated_To_Phy'] = paper_df.index.map(alloc_series).fillna(0.0)
     else:
         paper_df['Allocated_To_Phy'] = 0.0
-        
-    # 安全返回结果
-    if not hedge_relations:
-        # 返回带标准表头的空 DF，防止前端报错
-        cols = ['Cargo_ID', 'Ticket_ID', 'Month', 'Trade_Date', 'Allocated_Vol', 
-                'Open_Price', 'MTM_PL', 'Total_PL_Alloc', 'Time_Lag', 'Close_Path']
-        return pd.DataFrame(columns=cols), physical_df_sorted, paper_df
         
     return pd.DataFrame(hedge_relations), physical_df_sorted, paper_df
 
@@ -285,7 +297,7 @@ st.markdown("""
 col_title = st.columns([1])[0]
 with col_title:
     st.title("Hedge Master Analytics 📊")
-    st.markdown("**基于 v19 引擎的智能套保有效性分析系统** | *Designed for Energy Trading*")
+    st.markdown("**基于 v21 引擎 (Robust) 的智能套保有效性分析系统** | *Designed for Energy Trading*")
 
 st.divider()
 
@@ -294,7 +306,7 @@ with st.sidebar:
     ticket_file = st.file_uploader("上传纸货水单 (Ticket Data)", type=['xlsx', 'csv'])
     phys_file = st.file_uploader("上传实货台账 (Physical Ledger)", type=['xlsx', 'csv'])
     run_btn = st.button("🚀 开始全景分析", type="primary", use_container_width=True)
-    st.caption("Engine: v19 Logic (Open Match)")
+    st.caption("Engine: v21 Logic (Fix Key Error)")
 
 if run_btn:
     if ticket_file and phys_file:
@@ -320,9 +332,7 @@ if run_btn:
                 unhedged = df_ph_final['Unhedged_Volume'].abs().sum()
                 hedged_vol = total_exp - unhedged
                 coverage = (hedged_vol / total_exp * 100) if total_exp > 0 else 0
-                
-                # 安全获取 MTM，如果空则为0
-                total_mtm = df_rels['MTM_PL'].sum() if 'MTM_PL' in df_rels.columns else 0
+                total_mtm = df_rels['MTM_PL'].sum() if not df_rels.empty else 0
                 
                 kpi1, kpi2, kpi3, kpi4 = st.columns(4)
                 kpi1.metric("实货总敞口", f"{total_exp:,.0f} BBL")
@@ -352,6 +362,7 @@ if run_btn:
 
                 # --- Tables ---
                 st.subheader("📋 数据账本")
+                # 修复引号
                 tab1, tab2, tab3 = st.tabs(["✅ 匹配明细", "⚠️ 实货剩余", "📦 纸货剩余"])
                 
                 with tab1:
@@ -360,24 +371,23 @@ if run_btn:
                         csv = df_rels.to_csv(index=False).encode('utf-8')
                         st.download_button("📥 下载明细", csv, "hedge_allocation.csv", "text/csv")
                     else:
-                        st.info("无匹配记录")
+                        st.info("无匹配记录 (请检查实货Proxy和纸货Commodity名称是否包含关系)")
                         
                 with tab2:
                     st.dataframe(df_ph_final[abs(df_ph_final['Unhedged_Volume']) > 1], use_container_width=True)
                     
                 with tab3:
-                    # 修复 KeyError: 使用 .get() 安全访问列
-                    # 并确保 Allocated_To_Phy 一定存在 (auto_match_hedges 已保证)
-                    if 'Allocated_To_Phy' in df_p_final.columns and 'Volume' in df_p_final.columns:
-                        df_p_final['Implied_Remaining'] = df_p_final['Volume'] - df_p_final['Allocated_To_Phy']
-                        unused = df_p_final[abs(df_p_final['Implied_Remaining']) > 1]
-                        
-                        cols_show = ['Recap No', 'Std_Commodity', 'Month', 'Volume', 'Allocated_To_Phy', 'Implied_Remaining', 'Price']
-                        final_cols = [c for c in cols_show if c in unused.columns]
-                        st.dataframe(unused[final_cols], use_container_width=True)
-                    else:
-                        st.error("数据列丢失，无法计算剩余头寸。请检查 Allocated_To_Phy 是否正确回写。")
+                    # 容错：防止 Allocated_To_Phy 列依然丢失
+                    if 'Allocated_To_Phy' not in df_p_final.columns:
+                        df_p_final['Allocated_To_Phy'] = 0.0
+                    
+                    df_p_final['Implied_Remaining'] = df_p_final['Volume'] - df_p_final['Allocated_To_Phy']
+                    unused = df_p_final[abs(df_p_final['Implied_Remaining']) > 1]
+                    
+                    cols_show = ['Recap No', 'Std_Commodity', 'Month', 'Volume', 'Allocated_To_Phy', 'Implied_Remaining', 'Price']
+                    final_cols = [c for c in cols_show if c in unused.columns]
+                    st.dataframe(unused[final_cols], use_container_width=True)
             else:
-                st.error("数据加载为空")
+                st.error("数据加载为空，请检查文件编码或格式 (支持 .xlsx, .csv)")
     else:
         st.warning("请上传文件")
