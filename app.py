@@ -34,7 +34,6 @@ def load_data_engine(paper_file, phys_file):
         if paper_file.name.endswith(('.xlsx', '.xls')):
             df_p = pd.read_excel(paper_file)
         else:
-            # 尝试多种编码读取CSV
             try:
                 df_p = pd.read_csv(paper_file)
             except:
@@ -51,6 +50,10 @@ def load_data_engine(paper_file, phys_file):
     except Exception as e:
         st.error(f"文件读取失败: {e}")
         return pd.DataFrame(), pd.DataFrame()
+
+    # --- 清除列名空格 (关键修复) ---
+    df_p.columns = df_p.columns.str.strip()
+    df_ph.columns = df_ph.columns.str.strip()
 
     # --- 纸货清洗 ---
     df_p['Trade Date'] = pd.to_datetime(df_p['Trade Date'])
@@ -70,8 +73,14 @@ def load_data_engine(paper_file, phys_file):
         if col not in df_p.columns: df_p[col] = 0
 
     # --- 实货清洗 ---
-    col_map = {'Target_Pricing_Month':'Target_Contract_Month', 'Month':'Target_Contract_Month'}
+    # 兼容多种列名
+    col_map = {
+        'Target_Pricing_Month': 'Target_Contract_Month', 
+        'Target Pricing Month': 'Target_Contract_Month', 
+        'Month': 'Target_Contract_Month'
+    }
     df_ph.rename(columns=col_map, inplace=True)
+    
     df_ph['Volume'] = pd.to_numeric(df_ph['Volume'], errors='coerce').fillna(0)
     df_ph['Unhedged_Volume'] = df_ph['Volume']
     df_ph['Hedge_Proxy'] = clean_str(df_ph['Hedge_Proxy']) if 'Hedge_Proxy' in df_ph.columns else ''
@@ -211,7 +220,6 @@ def auto_match_hedges(physical_df, paper_df):
             if abs(phy_vol) < 1: break
             
             orig_idx = ticket['_original_index']
-            # 实时查余额
             curr_allocated = active_paper.at[orig_idx, 'Allocated_To_Phy']
             curr_net_open = active_paper.at[orig_idx, 'Net_Open_Vol']
             net_avail = curr_net_open - curr_allocated
@@ -233,10 +241,8 @@ def auto_match_hedges(physical_df, paper_df):
             total_pl = ticket.get('Total P/L', 0)
             close_path, _ = format_close_details(ticket.get('Close_Events', []))
             
-            # 简单分摊 MTM
             unrealized_mtm = (mtm_price - open_price) * alloc_amt
             
-            # 分摊总 PL
             ratio = 0
             if abs(ticket.get('Volume', 0)) > 0:
                 ratio = abs(alloc_amt) / abs(ticket['Volume'])
@@ -345,13 +351,17 @@ if run_btn:
                         # 聚合数据
                         chart_data = df_ph_final.groupby('Target_Contract_Month')[['Volume', 'Unhedged_Volume']].sum().abs().reset_index()
                         chart_data['Hedged'] = chart_data['Volume'] - chart_data['Unhedged_Volume']
-                        # 转换长格式用于 Plotly
-                        chart_long = pd.melt(chart_data, id_vars=['Target_Contract_Month'], value_vars=['Hedged', 'Unhedged_Volume'], var_name='Type', value_name='Volume')
                         
-                        fig = px.bar(chart_long, x='Target_Contract_Month', y='Volume', color='Type', 
-                                     title="Monthly Exposure vs Hedge",
-                                     color_discrete_map={'Hedged': '#00CC96', 'Unhedged_Volume': '#EF553B'},
-                                     template="plotly_white")
+                        # Fix: 使用 Plotly 宽模式代替 pd.melt，避免 ValueError
+                        fig = px.bar(
+                            chart_data, 
+                            x='Target_Contract_Month', 
+                            y=['Hedged', 'Unhedged_Volume'], 
+                            title="Monthly Exposure vs Hedge",
+                            labels={'value': 'Volume', 'variable': 'Type'},
+                            color_discrete_map={'Hedged': '#00CC96', 'Unhedged_Volume': '#EF553B'},
+                            template="plotly_white"
+                        )
                         st.plotly_chart(fig, use_container_width=True)
                     else:
                         st.warning("实货数据缺少 'Target_Contract_Month' 列，无法生成月度图表。")
@@ -369,7 +379,7 @@ if run_btn:
 
                 # --- 详细数据 Tab 页 ---
                 st.subheader("📋 详细数据账本")
-                # 修复引号问题：
+                # 修复引号问题
                 tab1, tab2, tab3 = st.tabs(["✅ 匹配明细账本 (Allocation)", "⚠️ 实货剩余敞口 (Unhedged Cargo)", "📦 纸货剩余头寸 (Unmatched Paper)"])
                 
                 with tab1:
