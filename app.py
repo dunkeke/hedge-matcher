@@ -6,7 +6,6 @@ import time
 import io
 import os
 import sys
-import tempfile
 
 # ==============================================================================
 # Streamlit 应用界面
@@ -67,230 +66,163 @@ st.markdown("""
 st.markdown('<div class="header-card">', unsafe_allow_html=True)
 st.title("🛡️ Hedge Master Analytics")
 st.markdown("**基于 v19 引擎的智能套保有效性分析系统**")
-st.caption("Version: 2.0 | 支持开放式时间匹配算法")
+st.caption("Version: 3.0 | 直接调用引擎核心函数")
 st.markdown('</div>', unsafe_allow_html=True)
 
 # ==============================================================================
-# 修复的数据预处理函数
+# 核心修复：直接使用引擎函数但不解包返回值
 # ==============================================================================
 
-def preprocess_paper_data(df_paper):
-    """预处理纸货数据，确保包含引擎所需的所有列"""
-    
-    # 创建副本
-    df = df_paper.copy()
-    
-    # 1. 确保有 Trade Date 列
-    if 'Trade Date' not in df.columns:
-        # 尝试找到日期列
-        date_cols = [col for col in df.columns if 'date' in col.lower() or '日期' in col]
-        if date_cols:
-            df['Trade Date'] = pd.to_datetime(df[date_cols[0]], errors='coerce')
-        else:
-            df['Trade Date'] = pd.NaT
-    
-    # 2. 确保有 Volume 列
-    if 'Volume' not in df.columns:
-        # 尝试找到数量列
-        vol_cols = [col for col in df.columns if 'vol' in col.lower() or '数量' in col or 'volume' in col.lower()]
-        if vol_cols:
-            df['Volume'] = pd.to_numeric(df[vol_cols[0]], errors='coerce').fillna(0)
-        else:
-            df['Volume'] = 0
-    
-    # 3. 确保有 Commodity 列
-    if 'Commodity' not in df.columns:
-        # 尝试找到品种列
-        comm_cols = [col for col in df.columns if 'commodity' in col.lower() or '品种' in col or 'product' in col.lower()]
-        if comm_cols:
-            df['Commodity'] = df[comm_cols[0]].astype(str)
-        else:
-            df['Commodity'] = 'UNKNOWN'
-    
-    # 4. 确保有 Month 列
-    if 'Month' not in df.columns:
-        # 尝试找到月份列
-        month_cols = [col for col in df.columns if 'month' in col.lower() or '月份' in col or '合约' in col]
-        if month_cols:
-            df['Month'] = df[month_cols[0]].astype(str)
-        else:
-            df['Month'] = ''
-    
-    # 5. 确保有 Price 列
-    if 'Price' not in df.columns:
-        # 尝试找到价格列
-        price_cols = [col for col in df.columns if 'price' in col.lower() or '价格' in col or 'price' in col.lower()]
-        if price_cols:
-            df['Price'] = pd.to_numeric(df[price_cols[0]], errors='coerce').fillna(0)
-        else:
-            df['Price'] = 0
-    
-    # 6. 创建 Std_Commodity 列（引擎必需）
-    df['Std_Commodity'] = df['Commodity'].astype(str).str.strip().str.upper().replace(['NAN', 'NONE', 'NULL', ''], 'UNKNOWN')
-    
-    # 7. 创建 Recap No 列（引擎必需）
-    if 'Recap No' not in df.columns:
-        df['Recap No'] = df.index.astype(str)
-    
-    # 8. 其他引擎需要的列
-    df['_original_index'] = df.index
-    
-    # 9. 初始化缺失金融字段
-    for col in ['Mtm Price', 'Total P/L']:
-        if col not in df.columns:
-            df[col] = 0
-    
-    return df
-
-def preprocess_physical_data(df_physical):
-    """预处理实货数据，确保包含引擎所需的所有列"""
-    
-    # 创建副本
-    df = df_physical.copy()
-    
-    # 1. 确保有 Cargo_ID 列
-    if 'Cargo_ID' not in df.columns:
-        # 尝试找到ID列
-        id_cols = [col for col in df.columns if 'id' in col.lower() or '编号' in col or 'cargo' in col.lower()]
-        if id_cols:
-            df['Cargo_ID'] = df[id_cols[0]].astype(str)
-        else:
-            df['Cargo_ID'] = df.index.astype(str)
-    
-    # 2. 确保有 Volume 列
-    if 'Volume' not in df.columns:
-        # 尝试找到数量列
-        vol_cols = [col for col in df.columns if 'vol' in col.lower() or '数量' in col or 'volume' in col.lower()]
-        if vol_cols:
-            df['Volume'] = pd.to_numeric(df[vol_cols[0]], errors='coerce').fillna(0)
-        else:
-            df['Volume'] = 0
-    
-    # 3. 确保有 Hedge_Proxy 列
-    if 'Hedge_Proxy' not in df.columns:
-        # 尝试找到对冲品种列
-        proxy_cols = [col for col in df.columns if 'proxy' in col.lower() or '对冲' in col or '品种' in col]
-        if proxy_cols:
-            df['Hedge_Proxy'] = df[proxy_cols[0]].astype(str)
-        else:
-            df['Hedge_Proxy'] = 'UNKNOWN'
-    
-    # 4. 确保有 Target_Contract_Month 列
-    if 'Target_Contract_Month' not in df.columns:
-        # 尝试找到目标合约月列
-        target_cols = [col for col in df.columns if 'target' in col.lower() or 'month' in col.lower() or '合约' in col or '月份' in col]
-        if target_cols:
-            df['Target_Contract_Month'] = df[target_cols[0]].astype(str)
-        else:
-            df['Target_Contract_Month'] = ''
-    
-    # 5. 确保有 Direction 列
-    if 'Direction' not in df.columns:
-        df['Direction'] = 'Buy'  # 默认值
-    
-    # 6. 初始化 Unhedged_Volume
-    df['Unhedged_Volume'] = df['Volume']
-    
-    # 7. 清理 Hedge_Proxy
-    df['Hedge_Proxy'] = df['Hedge_Proxy'].astype(str).str.strip().str.upper().replace(['NAN', 'NONE', 'NULL', ''], 'UNKNOWN')
-    
-    # 8. 指定日期列
-    if 'Designation_Date' not in df.columns:
-        # 尝试找到日期列
-        date_cols = [col for col in df.columns if 'date' in col.lower() or '日期' in col or 'pricing' in col.lower()]
-        if date_cols:
-            df['Designation_Date'] = pd.to_datetime(df[date_cols[0]], errors='coerce')
-        else:
-            df['Designation_Date'] = pd.NaT
-    
-    return df
-
-def read_file_smart(file_content, file_name):
-    """智能读取文件"""
-    file_name_lower = file_name.lower()
-    
-    try:
-        if file_name_lower.endswith(('.xlsx', '.xls')):
-            # 读取Excel
-            return pd.read_excel(io.BytesIO(file_content))
-        else:
-            # 尝试读取CSV，使用多种编码
-            encodings = ['utf-8', 'utf-8-sig', 'gbk', 'gb18030', 'latin1']
-            for enc in encodings:
-                try:
-                    return pd.read_csv(io.BytesIO(file_content), encoding=enc)
-                except:
-                    continue
-            # 最后尝试
-            return pd.read_csv(io.BytesIO(file_content), encoding='utf-8', errors='ignore')
-    except Exception as e:
-        st.error(f"读取文件失败: {str(e)}")
-        raise
-
-# ==============================================================================
-# 引擎包装函数
-# ==============================================================================
-
-def run_hedge_engine(paper_content, paper_name, phys_content, phys_name):
-    """运行对冲引擎"""
+def run_hedge_engine_safely(paper_content, paper_name, phys_content, phys_name):
+    """安全地运行对冲引擎，处理返回值问题"""
     try:
         # 导入引擎
         sys.path.append(os.path.dirname(__file__))
         import hedge_engine as engine
         
-        # 读取原始数据
-        df_paper_raw = read_file_smart(paper_content, paper_name)
-        df_physical_raw = read_file_smart(phys_content, phys_name)
+        # 显示引擎信息
+        st.sidebar.info(f"引擎版本: {engine.__name__}")
         
-        # 在侧边栏显示原始数据信息
-        with st.sidebar.expander("📊 原始数据信息"):
+        # 读取数据
+        def read_file(file_content, file_name):
+            file_name_lower = file_name.lower()
+            if file_name_lower.endswith(('.xlsx', '.xls')):
+                return pd.read_excel(io.BytesIO(file_content))
+            else:
+                # 尝试多种编码
+                encodings = ['utf-8', 'utf-8-sig', 'gbk', 'gb18030', 'latin1']
+                for enc in encodings:
+                    try:
+                        return pd.read_csv(io.BytesIO(file_content), encoding=enc)
+                    except:
+                        continue
+                return pd.read_csv(io.BytesIO(file_content), encoding='utf-8', errors='ignore')
+        
+        # 读取原始数据
+        df_paper_raw = read_file(paper_content, paper_name)
+        df_physical_raw = read_file(phys_content, phys_name)
+        
+        # 显示数据信息
+        with st.sidebar.expander("📊 数据信息"):
             st.write("**纸货数据:**")
             st.write(f"- 行数: {len(df_paper_raw)}")
-            st.write(f"- 列数: {len(df_paper_raw.columns)}")
-            st.write(f"- 列名: {list(df_paper_raw.columns)[:10]}")
+            st.write(f"- 列名示例: {list(df_paper_raw.columns)[:5]}")
             
             st.write("**实货数据:**")
             st.write(f"- 行数: {len(df_physical_raw)}")
-            st.write(f"- 列数: {len(df_physical_raw.columns)}")
-            st.write(f"- 列名: {list(df_physical_raw.columns)[:10]}")
+            st.write(f"- 列名示例: {list(df_physical_raw.columns)[:5]}")
         
-        # 预处理数据
-        df_paper = preprocess_paper_data(df_paper_raw)
-        df_physical = preprocess_physical_data(df_physical_raw)
+        # 预处理数据 - 简化版本
+        # 纸货数据
+        df_paper = df_paper_raw.copy()
         
-        # 显示预处理后的数据信息
-        with st.sidebar.expander("🔄 预处理后数据"):
-            st.write("**纸货关键列:**")
-            paper_key_cols = ['Trade Date', 'Volume', 'Commodity', 'Month', 'Price', 'Std_Commodity']
-            for col in paper_key_cols:
-                if col in df_paper.columns:
-                    st.write(f"- ✓ {col}")
+        # 确保有必需列
+        if 'Trade Date' in df_paper.columns:
+            df_paper['Trade Date'] = pd.to_datetime(df_paper['Trade Date'], errors='coerce')
+        
+        if 'Volume' not in df_paper.columns:
+            # 尝试找到数量列
+            for col in df_paper.columns:
+                if 'vol' in col.lower() or '数量' in col:
+                    df_paper['Volume'] = pd.to_numeric(df_paper[col], errors='coerce').fillna(0)
+                    break
+            else:
+                df_paper['Volume'] = 0
+        
+        if 'Commodity' not in df_paper.columns:
+            # 尝试找到品种列
+            for col in df_paper.columns:
+                if 'commodity' in col.lower() or '品种' in col:
+                    df_paper['Commodity'] = df_paper[col].astype(str)
+                    break
+            else:
+                df_paper['Commodity'] = 'UNKNOWN'
+        
+        # 创建 Std_Commodity
+        df_paper['Std_Commodity'] = df_paper['Commodity'].astype(str).str.strip().str.upper()
+        
+        if 'Month' not in df_paper.columns:
+            df_paper['Month'] = ''
+        
+        if 'Recap No' not in df_paper.columns:
+            df_paper['Recap No'] = df_paper.index.astype(str)
+        
+        # 实货数据
+        df_physical = df_physical_raw.copy()
+        
+        if 'Volume' not in df_physical.columns:
+            # 尝试找到数量列
+            for col in df_physical.columns:
+                if 'vol' in col.lower() or '数量' in col:
+                    df_physical['Volume'] = pd.to_numeric(df_physical[col], errors='coerce').fillna(0)
+                    break
+            else:
+                df_physical['Volume'] = 0
+        
+        df_physical['Unhedged_Volume'] = df_physical['Volume']
+        
+        if 'Hedge_Proxy' not in df_physical.columns:
+            # 尝试找到对冲品种列
+            for col in df_physical.columns:
+                if 'proxy' in col.lower() or '对冲' in col or '品种' in col:
+                    df_physical['Hedge_Proxy'] = df_physical[col].astype(str)
+                    break
+            else:
+                df_physical['Hedge_Proxy'] = 'UNKNOWN'
+        
+        df_physical['Hedge_Proxy'] = df_physical['Hedge_Proxy'].astype(str).str.strip().str.upper()
+        
+        if 'Target_Contract_Month' not in df_physical.columns:
+            df_physical['Target_Contract_Month'] = ''
+        
+        # 关键修复：直接调用引擎函数但捕获所有返回值
+        st.sidebar.info("正在执行净仓计算...")
+        df_paper_net = engine.calculate_net_positions_corrected(df_paper)
+        
+        st.sidebar.info("正在执行实货匹配...")
+        
+        # 方法1：尝试直接调用并捕获所有返回值
+        try:
+            result = engine.auto_match_hedges(df_physical, df_paper_net)
+            
+            # 检查返回值类型
+            if isinstance(result, tuple):
+                if len(result) == 2:
+                    df_rels, df_physical_updated = result
+                elif len(result) == 3:
+                    df_rels, df_physical_updated, extra = result
+                    st.sidebar.warning(f"收到3个返回值，忽略第3个")
                 else:
-                    st.write(f"- ✗ {col} (缺失)")
-            
-            st.write("**实货关键列:**")
-            phys_key_cols = ['Cargo_ID', 'Volume', 'Hedge_Proxy', 'Target_Contract_Month', 'Unhedged_Volume']
-            for col in phys_key_cols:
-                if col in df_physical.columns:
-                    st.write(f"- ✓ {col}")
-                else:
-                    st.write(f"- ✗ {col} (缺失)")
+                    st.sidebar.error(f"意外的返回值数量: {len(result)}")
+                    # 只取前两个
+                    df_rels, df_physical_updated = result[0], result[1]
+            elif isinstance(result, pd.DataFrame):
+                # 如果只返回一个DataFrame
+                df_rels = result
+                df_physical_updated = df_physical.copy()
+            else:
+                raise ValueError(f"无法理解的返回值类型: {type(result)}")
+                
+        except ValueError as e:
+            if "too many values to unpack" in str(e):
+                st.sidebar.warning("检测到返回值解包问题，使用备用方案...")
+                # 方法2：使用try-except处理
+                try:
+                    # 尝试接收3个返回值
+                    df_rels, df_physical_updated, _ = engine.auto_match_hedges(df_physical, df_paper_net)
+                except:
+                    # 方法3：使用占位符
+                    result = engine.auto_match_hedges(df_physical, df_paper_net)
+                    df_rels = result[0] if len(result) > 0 else pd.DataFrame()
+                    df_physical_updated = result[1] if len(result) > 1 else df_physical.copy()
+            else:
+                raise
         
-        # 运行引擎核心函数
-        if not df_physical.empty:
-            # Step 1: 净仓计算
-            df_paper_net = engine.calculate_net_positions_corrected(df_paper)
-            
-            # Step 2: 实货匹配
-            df_rels, df_physical_updated = engine.auto_match_hedges(df_physical, df_paper_net)
-            
-            # Step 3: 准备纸货最终数据
-            df_paper_final = df_paper_net.copy()
-            
-            return df_rels, df_physical_updated, df_paper_final
-        else:
-            return pd.DataFrame(), df_physical, df_paper
-            
+        # 准备纸货最终数据
+        df_paper_final = df_paper_net.copy()
+        
+        return df_rels, df_physical_updated, df_paper_final
+        
     except Exception as e:
         raise e
 
@@ -331,20 +263,12 @@ with st.sidebar:
     
     st.markdown("---")
     
-    # 调试选项
-    debug_mode = st.checkbox("调试模式", value=False)
-    
-    st.markdown("---")
-    
     run_btn = st.button(
-        "🚀 开始全景分析", 
+        "🚀 开始匹配分析", 
         type="primary", 
         use_container_width=True,
         disabled=not (ticket_file and phys_file)
     )
-    
-    if not (ticket_file and phys_file):
-        st.warning("请先上传两个文件")
 
 # ==============================================================================
 # 主内容区域
@@ -353,202 +277,131 @@ with st.sidebar:
 if run_btn and ticket_file and phys_file:
     with st.spinner('正在执行匹配运算...'):
         try:
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            
-            # 步骤1: 准备数据
-            status_text.text("步骤 1/3: 读取和预处理数据...")
-            progress_bar.progress(30)
-            
             # 获取文件内容
             paper_content = ticket_file.getvalue()
             paper_name = ticket_file.name
             phys_content = phys_file.getvalue()
             phys_name = phys_file.name
             
-            # 步骤2: 运行引擎
-            status_text.text("步骤 2/3: 执行套保匹配引擎...")
-            progress_bar.progress(60)
-            
+            # 运行引擎
             start_t = time.time()
             
-            # 运行引擎
-            df_rels, df_ph_final, df_p_final = run_hedge_engine(
+            df_rels, df_ph_final, df_p_final = run_hedge_engine_safely(
                 paper_content, paper_name, phys_content, phys_name
             )
             
             calc_time = time.time() - start_t
             
-            # 步骤3: 显示结果
-            status_text.text("步骤 3/3: 生成分析报告...")
-            progress_bar.progress(90)
+            st.markdown(f'<div class="success-message">✅ 分析完成！耗时 {calc_time:.2f} 秒</div>', unsafe_allow_html=True)
             
-            progress_bar.progress(100)
-            status_text.text("✅ 分析完成！")
-            
-            st.markdown(f'<div class="success-message">分析完成！耗时 {calc_time:.2f} 秒</div>', unsafe_allow_html=True)
-            
-            # --- 显示结果 ---
-            st.markdown("## 📊 分析结果")
-            
+            # 显示结果
             if not df_rels.empty:
-                st.success(f"✅ 成功匹配 {len(df_rels)} 笔交易")
+                st.success(f"🎉 成功匹配 {len(df_rels)} 笔交易")
                 
-                # 显示关键指标
-                col1, col2, col3, col4 = st.columns(4)
+                # 显示摘要
+                col1, col2, col3 = st.columns(3)
                 
                 with col1:
-                    if 'Allocated_Vol' in df_rels.columns:
-                        total = df_rels['Allocated_Vol'].abs().sum()
-                        st.metric("总匹配量", f"{total:,.0f} BBL")
+                    total_allocated = df_rels['Allocated_Vol'].abs().sum() if 'Allocated_Vol' in df_rels.columns else 0
+                    st.metric("总匹配量", f"{total_allocated:,.0f} BBL")
                 
                 with col2:
-                    if 'Proxy' in df_rels.columns:
-                        unique = df_rels['Proxy'].nunique()
-                        st.metric("涉及品种", unique)
+                    total_exposure = df_ph_final['Volume'].abs().sum() if 'Volume' in df_ph_final.columns else 0
+                    coverage = (total_allocated / total_exposure * 100) if total_exposure > 0 else 0
+                    st.metric("套保覆盖率", f"{coverage:.1f}%")
                 
                 with col3:
-                    if 'Month' in df_rels.columns:
-                        unique = df_rels['Month'].nunique()
-                        st.metric("涉及合约月", unique)
+                    total_mtm = df_rels['Alloc_Unrealized_MTM'].sum() if 'Alloc_Unrealized_MTM' in df_rels.columns else 0
+                    st.metric("组合MTM", f"${total_mtm:,.0f}")
                 
-                with col4:
-                    if 'Alloc_Unrealized_MTM' in df_rels.columns:
-                        total_mtm = df_rels['Alloc_Unrealized_MTM'].sum()
-                        st.metric("总MTM", f"${total_mtm:,.0f}")
-                
-                # 显示匹配结果
+                # 显示匹配明细
                 st.markdown("### 📋 匹配明细")
                 st.dataframe(df_rels, use_container_width=True)
                 
                 # 下载按钮
                 csv = df_rels.to_csv(index=False).encode('utf-8')
                 st.download_button(
-                    "📥 下载匹配明细 CSV",
+                    "📥 下载匹配明细",
                     data=csv,
-                    file_name="hedge_allocation_details.csv",
+                    file_name="hedge_matches.csv",
                     mime="text/csv",
                     use_container_width=True
                 )
                 
-                # 显示匹配统计图表
-                st.markdown("### 📈 匹配统计")
+                # 显示剩余敞口
+                st.markdown("### 📊 剩余敞口分析")
                 
-                if 'Proxy' in df_rels.columns and 'Allocated_Vol' in df_rels.columns:
-                    proxy_summary = df_rels.groupby('Proxy')['Allocated_Vol'].abs().sum().reset_index()
-                    proxy_summary = proxy_summary.sort_values('Allocated_Vol', ascending=False)
-                    
-                    fig1 = px.bar(proxy_summary, x='Proxy', y='Allocated_Vol',
-                                 title="各品种匹配量",
-                                 color='Proxy')
-                    st.plotly_chart(fig1, use_container_width=True)
-                
-                if 'Month' in df_rels.columns and 'Allocated_Vol' in df_rels.columns:
-                    month_summary = df_rels.groupby('Month')['Allocated_Vol'].abs().sum().reset_index()
-                    month_summary = month_summary.sort_values('Month')
-                    
-                    fig2 = px.bar(month_summary, x='Month', y='Allocated_Vol',
-                                 title="各合约月匹配量",
-                                 color='Month')
-                    st.plotly_chart(fig2, use_container_width=True)
+                if 'Unhedged_Volume' in df_ph_final.columns:
+                    remaining = df_ph_final[abs(df_ph_final['Unhedged_Volume']) > 0.1]
+                    if not remaining.empty:
+                        st.warning(f"⚠️ 还有 {len(remaining)} 笔实货未完全对冲")
+                        st.dataframe(remaining[['Cargo_ID', 'Volume', 'Unhedged_Volume', 'Hedge_Proxy']], 
+                                   use_container_width=True)
+                    else:
+                        st.success("✅ 所有实货均已完全对冲")
                 
             else:
                 st.warning("⚠️ 未找到匹配结果")
                 
-                # 显示详细诊断信息
-                if debug_mode:
-                    st.markdown("## 🔍 详细诊断")
+                # 显示数据预览帮助诊断
+                st.markdown("### 🔍 数据预览")
+                
+                # 重新读取数据
+                def quick_read(content, name):
+                    if name.lower().endswith(('.xlsx', '.xls')):
+                        return pd.read_excel(io.BytesIO(content))
+                    else:
+                        return pd.read_csv(io.BytesIO(content), encoding='utf-8', errors='ignore')
+                
+                df_paper_preview = quick_read(paper_content, paper_name)
+                df_phys_preview = quick_read(phys_content, phys_name)
+                
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.write("**纸货数据前5行:**")
+                    st.dataframe(df_paper_preview.head(), use_container_width=True)
+                    st.write(f"总行数: {len(df_paper_preview)}")
+                    if 'Commodity' in df_paper_preview.columns:
+                        st.write(f"品种数: {df_paper_preview['Commodity'].nunique()}")
+                
+                with col2:
+                    st.write("**实货数据前5行:**")
+                    st.dataframe(df_phys_preview.head(), use_container_width=True)
+                    st.write(f"总行数: {len(df_phys_preview)}")
+                    if 'Hedge_Proxy' in df_phys_preview.columns:
+                        st.write(f"对冲品种数: {df_phys_preview['Hedge_Proxy'].nunique()}")
+                
+                # 匹配诊断
+                st.markdown("### 🔧 匹配诊断")
+                
+                if 'Commodity' in df_paper_preview.columns and 'Hedge_Proxy' in df_phys_preview.columns:
+                    paper_com = set(str(x).upper().strip() for x in df_paper_preview['Commodity'].dropna().unique())
+                    phys_proxy = set(str(x).upper().strip() for x in df_phys_preview['Hedge_Proxy'].dropna().unique())
                     
-                    # 重新读取原始数据
-                    df_paper_raw = read_file_smart(paper_content, paper_name)
-                    df_physical_raw = read_file_smart(phys_content, phys_name)
-                    
-                    # 显示原始数据
-                    col1, col2 = st.columns(2)
-                    
-                    with col1:
-                        st.subheader("📄 原始纸货数据")
-                        st.write("前5行:")
-                        st.dataframe(df_paper_raw.head(), use_container_width=True)
-                        
-                        st.write("数据统计:")
-                        st.write(f"- 总行数: {len(df_paper_raw)}")
-                        st.write(f"- 列数: {len(df_paper_raw.columns)}")
-                        if 'Commodity' in df_paper_raw.columns:
-                            st.write(f"- 品种数: {df_paper_raw['Commodity'].nunique()}")
-                            st.write(f"- 品种列表: {list(df_paper_raw['Commodity'].unique())[:10]}")
-                    
-                    with col2:
-                        st.subheader("📦 原始实货数据")
-                        st.write("前5行:")
-                        st.dataframe(df_physical_raw.head(), use_container_width=True)
-                        
-                        st.write("数据统计:")
-                        st.write(f"- 总行数: {len(df_physical_raw)}")
-                        st.write(f"- 列数: {len(df_physical_raw.columns)}")
-                        if 'Hedge_Proxy' in df_physical_raw.columns:
-                            st.write(f"- 对冲品种数: {df_physical_raw['Hedge_Proxy'].nunique()}")
-                            st.write(f"- 对冲品种列表: {list(df_physical_raw['Hedge_Proxy'].unique())[:10]}")
-                    
-                    # 匹配可能性分析
-                    st.markdown("### 🔧 匹配可能性分析")
-                    
-                    if 'Commodity' in df_paper_raw.columns and 'Hedge_Proxy' in df_physical_raw.columns:
-                        paper_commodities = set(str(x).upper().strip() for x in df_paper_raw['Commodity'].dropna().unique())
-                        phys_proxies = set(str(x).upper().strip() for x in df_physical_raw['Hedge_Proxy'].dropna().unique())
-                        
-                        st.write(f"纸货品种数: {len(paper_commodities)}")
-                        st.write(f"实货对冲品种数: {len(phys_proxies)}")
-                        
-                        common = paper_commodities.intersection(phys_proxies)
-                        
+                    if paper_com and phys_proxy:
+                        common = paper_com.intersection(phys_proxy)
                         if common:
-                            st.success(f"✅ 找到 {len(common)} 个共同品种")
-                            st.write(f"共同品种: {list(common)}")
+                            st.success(f"✅ 找到 {len(common)} 个共同品种: {list(common)[:5]}")
                         else:
-                            st.error("❌ 没有共同品种！")
-                            st.write(f"纸货品种: {list(paper_commodities)}")
-                            st.write(f"实货对冲品种: {list(phys_proxies)}")
-                    
-                    # 数据质量检查
-                    st.markdown("### 📊 数据质量检查")
-                    
-                    check_col1, check_col2 = st.columns(2)
-                    
-                    with check_col1:
-                        st.write("**纸货数据检查:**")
-                        if 'Volume' in df_paper_raw.columns:
-                            zero_volume = (df_paper_raw['Volume'] == 0).sum()
-                            st.write(f"- 零数量交易: {zero_volume}")
-                        
-                        if 'Commodity' in df_paper_raw.columns:
-                            empty_commodity = df_paper_raw['Commodity'].isna().sum()
-                            st.write(f"- 空品种: {empty_commodity}")
-                    
-                    with check_col2:
-                        st.write("**实货数据检查:**")
-                        if 'Volume' in df_physical_raw.columns:
-                            zero_volume = (df_physical_raw['Volume'] == 0).sum()
-                            st.write(f"- 零数量实货: {zero_volume}")
-                        
-                        if 'Hedge_Proxy' in df_physical_raw.columns:
-                            empty_proxy = df_physical_raw['Hedge_Proxy'].isna().sum()
-                            st.write(f"- 空对冲品种: {empty_proxy}")
-            
+                            st.error(f"❌ 没有共同品种！")
+                            st.write(f"纸货品种: {list(paper_com)[:10]}")
+                            st.write(f"实货品种: {list(phys_proxy)[:10]}")
+                
         except Exception as e:
             st.error(f"❌ 运行时错误: {str(e)}")
             
-            # 显示详细的错误信息
-            with st.expander("🔍 查看详细错误信息"):
+            # 显示简化的错误信息
+            with st.expander("查看错误详情"):
                 import traceback
-                st.code(traceback.format_exc())
+                st.code(str(e))
             
-            st.info("💡 解决方案:")
+            st.info("💡 建议检查:")
             st.markdown("""
-            1. **检查文件格式**: 确保上传的是正确的Excel或CSV文件
-            2. **检查列名**: 确保文件包含必要的列名
-            3. **检查数据**: 确保数据格式正确，没有空值
-            4. **联系支持**: 如果问题持续，请提供文件样本以便调试
+            1. 文件格式是否正确
+            2. 是否包含必需的列名
+            3. 数据是否有空值或格式错误
+            4. 品种名称是否匹配
             """)
 else:
     # 显示欢迎界面
@@ -558,39 +411,35 @@ else:
     ### 🚀 快速开始
     
     1. **上传数据**: 在左侧上传纸货水单和实货台账
-    2. **开始分析**: 点击"开始全景分析"按钮
+    2. **开始分析**: 点击"开始匹配分析"按钮
     3. **查看结果**: 系统将自动计算匹配结果
     
-    ### 📁 支持的文件格式
+    ### 📋 必需的数据列
     
-    - **纸货水单**: Excel (.xlsx, .xls), CSV
-    - **实货台账**: Excel (.xlsx, .xls), CSV
+    **纸货水单需要包含:**
+    - `Trade Date`: 交易日期
+    - `Commodity`: 交易品种
+    - `Month`: 合约月份
+    - `Volume`: 交易数量
     
-    ### 📋 必需的列名（或类似列名）
+    **实货台账需要包含:**
+    - `Cargo_ID`: 实货编号
+    - `Volume`: 实货数量
+    - `Hedge_Proxy`: 对冲品种
+    - `Target_Contract_Month`: 目标合约月
     
-    **纸货文件**:
-    - `Trade Date` (或包含"date"的列)
-    - `Commodity` (或包含"commodity"、"品种"的列)
-    - `Month` (或包含"month"、"月份"的列)
-    - `Volume` (或包含"volume"、"数量"的列)
+    ### ⚡ 系统特性
     
-    **实货文件**:
-    - `Cargo_ID` (或包含"id"、"编号"的列)
-    - `Volume` (或包含"volume"、"数量"的列)
-    - `Hedge_Proxy` (或包含"proxy"、"对冲"、"品种"的列)
-    - `Target_Contract_Month` (或包含"target"、"month"、"合约"的列)
-    
-    ### ⚙️ 系统特性
-    
-    - **智能列名识别**: 系统会自动识别常见的中英文列名
-    - **数据预处理**: 自动处理缺失值和格式问题
-    - **详细调试**: 开启调试模式查看详细处理过程
+    - **智能匹配**: 使用先进的匹配算法
+    - **自动处理**: 自动识别数据格式
+    - **实时分析**: 快速生成匹配结果
+    - **详细报告**: 提供完整的匹配明细
     """)
 
 # 页脚
 st.markdown("---")
 st.markdown("""
 <div style="text-align: center; color: #666; font-size: 0.9em;">
-    <p>Hedge Master Analytics v2.0 | 基于 v19 套保引擎</p>
+    <p>Hedge Master Analytics v3.0 | 专业套保匹配工具</p>
 </div>
 """, unsafe_allow_html=True)
