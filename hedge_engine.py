@@ -269,6 +269,7 @@ def auto_match_hedges(physical_df, paper_df):
         # 排序策略 (v19: Abs_Lag 优先)
         if pd.notna(desig_date) and not candidates_df['Trade Date'].isnull().all():
             candidates_df['Time_Lag_Days'] = (candidates_df['Trade Date'] - desig_date).dt.days
+            candidates_df = candidates_df[candidates_df['Time_Lag_Days'] >= 0]
             candidates_df['Abs_Lag'] = candidates_df['Time_Lag_Days'].abs()
             candidates_df = candidates_df.sort_values(by=['Abs_Lag', 'Trade Date'])
         else:
