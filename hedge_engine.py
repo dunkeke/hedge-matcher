@@ -181,7 +181,7 @@ def calculate_net_positions_corrected(df_paper):
     return pd.DataFrame(records)
 
 def format_close_details(events):
-    if not events: return "", 0
+    if not events: return "", 0, 0
     details = []
     total_vol = 0
     total_val = 0
@@ -193,7 +193,29 @@ def format_close_details(events):
         if pd.notna(e['Price']):
             total_vol += e['Vol']
             total_val += (e['Vol'] * e['Price'])
-    return " -> ".join(details), total_vol
+    weighted_close_price = (total_val / total_vol) if total_vol > 0 else 0
+    return " -> ".join(details), weighted_close_price, total_vol
+
+def _match_start_date(paper_df):
+    trade_dates = paper_df.get('Trade Date')
+    if trade_dates is None or trade_dates.dropna().empty:
+        year = datetime.now().year
+    else:
+        year = trade_dates.dropna().dt.year.min()
+    return pd.Timestamp(year=year, month=11, day=12)
+
+def _contract_month_priority(month_value):
+    if pd.isna(month_value):
+        return 999, pd.Timestamp.max
+    parsed = pd.to_datetime(month_value, format="%b %y", errors="coerce")
+    if pd.isna(parsed):
+        parsed = pd.to_datetime(month_value, errors="coerce")
+    if pd.isna(parsed):
+        return 999, pd.Timestamp.max
+    key = f"{parsed.year}-{parsed.month:02d}"
+    priority_order = ["2026-04", "2026-05", "2026-01", "2026-02", "2026-03"]
+    priority = priority_order.index(key) if key in priority_order else 999
+    return priority, parsed
 
 def auto_match_hedges(physical_df, paper_df):
     """Step 2: 实货匹配 (v19 开放式逻辑 + 优先排序)"""
@@ -203,14 +225,26 @@ def auto_match_hedges(physical_df, paper_df):
     if 'Allocated_To_Phy' not in paper_df.columns:
         paper_df['Allocated_To_Phy'] = 0.0
     
-    # 索引构建 (只取有净敞口的单子)
-    active_paper = paper_df[abs(paper_df['Net_Open_Vol']) > 0.0001].copy()
+    match_start = _match_start_date(paper_df)
+    # 索引构建 (只取有净敞口且在指定日之后的单子)
+    active_paper = paper_df[
+        (abs(paper_df['Net_Open_Vol']) > 0.0001) &
+        (paper_df['Trade Date'] >= match_start)
+    ].copy()
     active_paper['Allocated_To_Phy'] = 0.0
     active_paper['_original_index'] = active_paper.index
 
-    # 实货排序 (抢单公平性)
+    # 实货排序 (优先级: Pricing_Benchmark -> Contract Month -> Designation Date)
     physical_df['Sort_Date'] = physical_df['Designation_Date'].fillna(pd.Timestamp.max)
-    physical_df_sorted = physical_df.sort_values(by=['Sort_Date', 'Cargo_ID'])
+    physical_df['Benchmark_Priority'] = physical_df['Pricing_Benchmark'].apply(
+        lambda x: 0 if 'BRENT' in str(x).upper() else (1 if 'JCC' in str(x).upper() else 2)
+    )
+    contract_priority = physical_df['Target_Contract_Month'].apply(_contract_month_priority)
+    physical_df['Contract_Priority'] = contract_priority.map(lambda x: x[0])
+    physical_df['Contract_Date'] = contract_priority.map(lambda x: x[1])
+    physical_df_sorted = physical_df.sort_values(
+        by=['Benchmark_Priority', 'Contract_Priority', 'Contract_Date', 'Sort_Date', 'Cargo_ID']
+    )
 
     for idx, cargo in physical_df_sorted.iterrows():
         cargo_id = cargo['Cargo_ID']
@@ -267,7 +301,7 @@ def auto_match_hedges(physical_df, paper_df):
             open_price = ticket.get('Price', 0)
             mtm_price = ticket.get('Mtm Price', 0)
             total_pl = ticket.get('Total P/L', 0)
-            close_path, _ = format_close_details(ticket.get('Close_Events', []))
+            close_path, close_avg_price, close_vol = format_close_details(ticket.get('Close_Events', []))
             
             unrealized_mtm = (mtm_price - open_price) * alloc_amt
             ratio = 0
@@ -285,7 +319,9 @@ def auto_match_hedges(physical_df, paper_df):
                 'MTM_PL': round(unrealized_mtm, 2),
                 'Total_PL_Alloc': round(alloc_total_pl, 2),
                 'Time_Lag': ticket.get('Time_Lag_Days'),
-                'Close_Path': close_path
+                'Close_Path': close_path,
+                'Close_Avg_Price': close_avg_price,
+                'Close_Volume': close_vol
             })
             
         physical_df_sorted.at[idx, 'Unhedged_Volume'] = phy_vol
