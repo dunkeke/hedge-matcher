@@ -410,7 +410,11 @@ def main():
                         
                         with tab1:
                             # 按Cargo_ID的匹配量
-                            cargo_summary = df_relations.groupby('Cargo_ID')['Allocated_Vol'].abs().sum().reset_index()
+                            cargo_summary = (
+                                df_relations.assign(Allocated_Vol=df_relations['Allocated_Vol'].abs())
+                                .groupby('Cargo_ID', as_index=False)['Allocated_Vol']
+                                .sum()
+                            )
                             fig1 = px.bar(cargo_summary, x='Cargo_ID', y='Allocated_Vol',
                                          title='各Cargo_ID匹配量',
                                          labels={'Allocated_Vol': '匹配量', 'Cargo_ID': 'Cargo ID'})
