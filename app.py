@@ -158,27 +158,54 @@ def format_close_details(events):
     weighted_close_price = (total_val / total_vol) if total_vol > 0 else 0
     return " -> ".join(details), weighted_close_price, total_vol
 
+def _match_start_date(paper_df):
+    trade_dates = paper_df.get('Trade Date')
+    if trade_dates is None or trade_dates.dropna().empty:
+        year = datetime.now().year
+    else:
+        year = trade_dates.dropna().dt.year.min()
+    return pd.Timestamp(year=year, month=11, day=12)
+
+def _contract_month_priority(month_value):
+    if pd.isna(month_value):
+        return 999, pd.Timestamp.max
+    parsed = pd.to_datetime(month_value, format="%b %y", errors="coerce")
+    if pd.isna(parsed):
+        parsed = pd.to_datetime(month_value, errors="coerce")
+    if pd.isna(parsed):
+        return 999, pd.Timestamp.max
+    key = f"{parsed.year}-{parsed.month:02d}"
+    priority_order = ["2026-04", "2026-05", "2026-01", "2026-02", "2026-03"]
+    priority = priority_order.index(key) if key in priority_order else 999
+    return priority, parsed
+
 def auto_match_hedges(physical_df, paper_df):
     """实货匹配逻辑"""
     hedge_relations = []
     st.info("开始实货匹配...")
     progress_bar = st.progress(0)
-    
-    active_paper = paper_df.copy()
+
+    match_start = _match_start_date(paper_df)
+    active_paper = paper_df[paper_df['Trade Date'] >= match_start].copy()
     active_paper['Allocated_To_Phy'] = 0.0
     active_paper['_original_index'] = active_paper.index
     
     df_phy = physical_df.copy()
     df_phy['_orig_idx'] = df_phy.index
     
-    # 根据定价基准优先级对实货排序：BRENT 优先匹配
+    # 根据定价基准优先级对实货排序：BRENT 优先匹配，JCC 次之
     if 'Pricing_Benchmark' in df_phy.columns:
         def bench_prio(x):
             x_str = str(x).upper()
-            return 0 if 'BRENT' in x_str else 1
+            return 0 if 'BRENT' in x_str else (1 if 'JCC' in x_str else 2)
         df_phy['_priority'] = df_phy['Pricing_Benchmark'].apply(bench_prio)
-        df_phy = df_phy.sort_values(by=['_priority', '_orig_idx']).reset_index(drop=True)
-        df_phy = df_phy.drop(columns=['_priority'])
+        contract_priority = df_phy['Target_Contract_Month'].apply(_contract_month_priority)
+        df_phy['_contract_priority'] = contract_priority.map(lambda x: x[0])
+        df_phy['_contract_date'] = contract_priority.map(lambda x: x[1])
+        df_phy = df_phy.sort_values(
+            by=['_priority', '_contract_priority', '_contract_date', '_orig_idx']
+        ).reset_index(drop=True)
+        df_phy = df_phy.drop(columns=['_priority', '_contract_priority', '_contract_date'])
     else:
         df_phy = df_phy.reset_index(drop=True)
     
@@ -235,7 +262,7 @@ def auto_match_hedges(physical_df, paper_df):
             mtm_price = ticket.get('Mtm Price', 0)
             total_pl_raw = ticket.get('Total P/L', 0)
             close_events = ticket.get('Close_Events', [])
-            close_path_str, avg_close_price, _ = format_close_details(close_events)
+            close_path_str, avg_close_price, close_vol = format_close_details(close_events)
             unrealized_mtm = (mtm_price - open_price) * alloc_amt
             ratio = 0
             if abs(ticket.get('Volume', 0)) > 0:
@@ -259,6 +286,8 @@ def auto_match_hedges(physical_df, paper_df):
                 'Alloc_Unrealized_MTM': round(unrealized_mtm, 2),
                 'Alloc_Total_PL': round(allocated_total_pl, 2),
                 'Close_Path_Details': close_path_str,
+                'Close_Avg_Price': avg_close_price,
+                'Close_Volume': close_vol,
             })
             
             # 更新实货未对冲量
@@ -272,7 +301,38 @@ def auto_match_hedges(physical_df, paper_df):
     cols_to_update = active_paper[['_original_index', 'Allocated_To_Phy']].set_index('_original_index')
     paper_df.update(cols_to_update)
     
-    return pd.DataFrame(hedge_relations), physical_df
+    relations_df = pd.DataFrame(hedge_relations)
+    open_summary = pd.DataFrame()
+    close_summary = pd.DataFrame()
+    close_details = pd.DataFrame()
+    if not relations_df.empty:
+        open_df = relations_df[relations_df['Allocated_Vol'] > 0].copy()
+        if not open_df.empty:
+            open_summary = (
+                open_df.groupby('Month', as_index=False)
+                .apply(lambda g: pd.Series({
+                    'Open_Volume': g['Allocated_Vol'].sum(),
+                    'Weighted_Open_Price': (
+                        (g['Allocated_Vol'] * g['Open_Price']).sum() / g['Allocated_Vol'].sum()
+                    ) if g['Allocated_Vol'].sum() else 0
+                }))
+                .reset_index(drop=True)
+            )
+        close_details = relations_df[relations_df['Allocated_Vol'] < 0].sort_values(by='Open_Date')
+        if not close_details.empty:
+            close_summary = (
+                close_details.groupby('Month', as_index=False)
+                .apply(lambda g: pd.Series({
+                    'Close_Volume': g['Allocated_Vol'].sum(),
+                    'Weighted_Close_Price': (
+                        (g['Allocated_Vol'].abs() * g['Close_Avg_Price']).sum() /
+                        g['Allocated_Vol'].abs().sum()
+                    ) if g['Allocated_Vol'].abs().sum() else 0
+                }))
+                .reset_index(drop=True)
+            )
+
+    return relations_df, physical_df, open_summary, close_details, close_summary
 
 # ---------------------------------------------------------
 # 4. Streamlit 主应用
@@ -379,7 +439,13 @@ def main():
                     df_paper_net = calculate_net_positions_corrected(df_paper)
                     
                     # 2. 实货匹配
-                    df_relations, df_physical_updated = auto_match_hedges(df_physical, df_paper_net)
+                    (
+                        df_relations,
+                        df_physical_updated,
+                        open_summary,
+                        close_details,
+                        close_summary,
+                    ) = auto_match_hedges(df_physical, df_paper_net)
                     
                     # 显示结果
                     st.subheader("📊 匹配结果概览")
@@ -401,6 +467,26 @@ def main():
                     # 显示匹配明细
                     st.subheader("📋 匹配明细")
                     st.dataframe(df_relations, use_container_width=True)
+
+                    # 开仓/平仓汇总
+                    st.subheader("📌 开仓与平仓汇总")
+                    col_open, col_close = st.columns(2)
+                    with col_open:
+                        st.markdown("**开仓汇总（按合约月）**")
+                        if open_summary is not None and not open_summary.empty:
+                            st.dataframe(open_summary, use_container_width=True)
+                        else:
+                            st.info("暂无开仓汇总数据。")
+                    with col_close:
+                        st.markdown("**平仓汇总（按合约月）**")
+                        if close_summary is not None and not close_summary.empty:
+                            st.dataframe(close_summary, use_container_width=True)
+                        else:
+                            st.info("暂无平仓汇总数据。")
+
+                    if close_details is not None and not close_details.empty:
+                        st.markdown("**平仓明细（按时间顺序）**")
+                        st.dataframe(close_details, use_container_width=True)
                     
                     # 分析图表
                     if show_analysis and not df_relations.empty:
@@ -410,7 +496,9 @@ def main():
                         
                         with tab1:
                             # 按Cargo_ID的匹配量
-                            cargo_summary = df_relations.groupby('Cargo_ID')['Allocated_Vol'].abs().sum().reset_index()
+                            cargo_summary = df_relations.groupby('Cargo_ID', as_index=False).agg(
+                                Allocated_Vol=('Allocated_Vol', lambda series: series.abs().sum())
+                            )
                             fig1 = px.bar(cargo_summary, x='Cargo_ID', y='Allocated_Vol',
                                          title='各Cargo_ID匹配量',
                                          labels={'Allocated_Vol': '匹配量', 'Cargo_ID': 'Cargo ID'})
